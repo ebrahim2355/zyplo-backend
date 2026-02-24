@@ -78,7 +78,7 @@ async function run() {
 
     app.post("/auth/oauth", async (req, res) => {
       try {
-        const { name, email, provider } = req.body;
+        const { name, email, provider, providerId, image } = req.body;
 
         let user = await usersCollection.findOne({ email });
 
@@ -86,7 +86,9 @@ async function run() {
           const result = await usersCollection.insertOne({
             name,
             email,
+            image,
             provider,
+            providerId,
             createdAt: new Date(),
           });
 
