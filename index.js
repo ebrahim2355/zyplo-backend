@@ -44,7 +44,7 @@ const verifyToken = (req, res, next) => {
 async function run() {
   try {
     // Connect the client to the server	(optional starting in v4.7)
-    await client.connect();
+    // await client.connect();
 
     const db = client.db("zyplo-db");
     const usersCollection = db.collection("users");
@@ -557,6 +557,9 @@ app.get("/", (req, res) => {
   res.send("Zyplo server is running!");
 });
 
-app.listen(port, () => {
-  console.log(`Zyplo is listening on port ${port}`);
-});
+// app.listen(port, () => {
+//   console.log(`Zyplo is listening on port ${port}`);
+// });
+
+const serverless = require("serverless-http");
+module.exports = serverless(app);
