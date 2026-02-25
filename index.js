@@ -53,7 +53,7 @@ async function run() {
 
     app.post("/auth/register", async (req, res) => {
       try {
-        const { name, email, password } = req.body;
+        const { name, email, password, role } = req.body;
 
         const existingUser = await usersCollection.findOne({ email });
         if (existingUser) {
@@ -66,8 +66,9 @@ async function run() {
           name,
           email,
           password: hashedPassword,
+          role,
           provider: "credentials",
-          createdAt: new Date(),
+          createdAt: new Date().toISOString(),
         });
 
         res.json({ message: "User registered successfully" });
@@ -78,7 +79,7 @@ async function run() {
 
     app.post("/auth/oauth", async (req, res) => {
       try {
-        const { name, email, provider, providerId, image } = req.body;
+        const { name, email, provider, providerId, image, role } = req.body;
 
         let user = await usersCollection.findOne({ email });
 
@@ -87,9 +88,10 @@ async function run() {
             name,
             email,
             image,
+            role,
             provider,
             providerId,
-            createdAt: new Date(),
+            createdAt: new Date().toISOString(),
           });
 
           user = {
