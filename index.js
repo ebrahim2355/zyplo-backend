@@ -12,7 +12,7 @@ setServers(["1.1.1.1", "8.8.8.8"]);
 app.use(express.json());
 app.use(
   cors({
-    origin: ["http://localhost:3000", "zyplo-six.vercel.app"],
+    origin: ["http://localhost:3000", "https://zyplo-six.vercel.app"],
     credentials: true,
   }),
 );
