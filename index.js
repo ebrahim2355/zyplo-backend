@@ -162,8 +162,9 @@ async function run() {
           };
 
           if (attempts >= MAX_LOGIN_ATTEMPTS) {
-            updateData.lockUntil = new Date(Date.now() + LOCK_TIME);
-            updateData.loginAttempts = 0;
+            updateData.lockUntil = new Date(
+              Date.now() + LOCK_TIME,
+            ).toISOString();
           }
 
           await usersCollection.updateOne(
