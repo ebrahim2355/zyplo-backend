@@ -133,7 +133,7 @@ async function run() {
     const jwt = require("jsonwebtoken");
 
     const MAX_LOGIN_ATTEMPTS = 5;
-    const LOCK_TIME = 1 * 60 * 1000;
+    const LOCK_TIME = 30 * 1000;
 
     app.post("/auth/login", async (req, res) => {
       try {
