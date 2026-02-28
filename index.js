@@ -199,7 +199,7 @@ async function run() {
 
     // users api
 
-    app.get("/users", async (req, res) => {});
+    app.get("/users", async (req, res) => { });
 
     app.post("/users", async (req, res) => {
       const users = req.body;
@@ -369,6 +369,25 @@ async function run() {
         res.status(201).json({ member });
       },
     );
+
+    app.delete("/dashboard/workspaces/:workspaceId", verifyToken, async (req, res) => {
+      const { workspaceId } = req.params;
+      const me = getUserIdentity(req);
+
+      const workspace = await workspacesCollection.findOne({ _id: toId(workspaceId) });
+      if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+
+      const isOwner = (workspace.members || []).some(
+        (m) => String(m.userId) === String(me.id) && m.role === "Owner"
+      );
+      if (!isOwner) return res.status(403).json({ error: "Only owner can delete workspace" });
+
+      await projectsCollection.deleteMany({ workspaceId: toId(workspaceId) });
+      await tasksCollection.deleteMany({ workspaceId: toId(workspaceId) });
+      await workspacesCollection.deleteOne({ _id: toId(workspaceId) });
+
+      return res.json({ ok: true });
+    });
 
     // POST /dashboard/projects
     app.post("/dashboard/projects", verifyToken, async (req, res) => {
