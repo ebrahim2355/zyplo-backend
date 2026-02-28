@@ -12,7 +12,7 @@ setServers(["1.1.1.1", "8.8.8.8"]);
 app.use(express.json());
 app.use(
   cors({
-    origin: ["http://localhost:3000", "zyplo-six.vercel.app"],
+    origin: ["http://localhost:3000", "https://zyplo-six.vercel.app"],
     credentials: true,
   }),
 );
@@ -44,7 +44,7 @@ const verifyToken = (req, res, next) => {
 async function run() {
   try {
     // Connect the client to the server	(optional starting in v4.7)
-    await client.connect();
+    // await client.connect();
 
     const db = client.db("zyplo-db");
     const usersCollection = db.collection("users");
@@ -69,7 +69,7 @@ async function run() {
 
     app.post("/auth/register", async (req, res) => {
       try {
-        const { name, email, password } = req.body;
+        const { name, email, password, role } = req.body;
 
         const existingUser = await usersCollection.findOne({ email });
         if (existingUser) {
@@ -82,8 +82,11 @@ async function run() {
           name,
           email,
           password: hashedPassword,
+          role,
           provider: "credentials",
-          createdAt: new Date(),
+          loginAttempts: 0,
+          lockUntil: null,
+          createdAt: new Date().toISOString(),
         });
 
         res.json({ message: "User registered successfully" });
@@ -94,7 +97,7 @@ async function run() {
 
     app.post("/auth/oauth", async (req, res) => {
       try {
-        const { name, email, provider, providerId, image } = req.body;
+        const { name, email, provider, providerId, image, role } = req.body;
 
         let user = await usersCollection.findOne({ email });
 
@@ -103,9 +106,10 @@ async function run() {
             name,
             email,
             image,
+            role,
             provider,
             providerId,
-            createdAt: new Date(),
+            createdAt: new Date().toISOString(),
           });
 
           user = {
@@ -128,18 +132,60 @@ async function run() {
     // login api
     const jwt = require("jsonwebtoken");
 
+    const MAX_LOGIN_ATTEMPTS = 5;
+    const LOCK_TIME = 30 * 1000;
+
     app.post("/auth/login", async (req, res) => {
       try {
         const { email, password } = req.body;
 
         const user = await usersCollection.findOne({ email });
 
-        if (!user) return res.status(400).json({ message: "User not found" });
+        if (!user) {
+          return res.status(400).json({ message: "Invalid credentials" });
+        }
+
+        if (user.lockUntil && new Date(user.lockUntil) > new Date()) {
+          return res.status(403).json({
+            message: "Account locked",
+            lockUntil: user.lockUntil,
+          });
+        }
 
         const isValid = await bcrypt.compare(password, user.password);
 
-        if (!isValid)
-          return res.status(400).json({ message: "Invalid password" });
+        if (!isValid) {
+          const attempts = (user.loginAttempts || 0) + 1;
+
+          const updateData = {
+            loginAttempts: attempts,
+          };
+
+          if (attempts >= MAX_LOGIN_ATTEMPTS) {
+            updateData.lockUntil = new Date(
+              Date.now() + LOCK_TIME,
+            ).toISOString();
+          }
+
+          await usersCollection.updateOne(
+            { _id: user._id },
+            { $set: updateData },
+          );
+
+          return res.status(400).json({
+            message: "Invalid credentials",
+          });
+        }
+
+        await usersCollection.updateOne(
+          { _id: user._id },
+          {
+            $set: {
+              loginAttempts: 0,
+              lockUntil: null,
+            },
+          },
+        );
 
         res.json({
           id: user._id,
@@ -172,8 +218,13 @@ async function run() {
         .toArray();
 
       const workspaceIds = workspaceDocs.map((w) => w._id);
-      const projects = await projectsCollection.find({ workspaceId: { $in: workspaceIds } }).toArray();
-      const tasks = await tasksCollection.find({ workspaceId: { $in: workspaceIds } }).sort({ createdAt: -1 }).toArray();
+      const projects = await projectsCollection
+        .find({ workspaceId: { $in: workspaceIds } })
+        .toArray();
+      const tasks = await tasksCollection
+        .find({ workspaceId: { $in: workspaceIds } })
+        .sort({ createdAt: -1 })
+        .toArray();
       const notifications = await notificationsCollection
         .find({ userId: String(me.id) })
         .sort({ createdAt: -1 })
@@ -227,15 +278,25 @@ async function run() {
     app.post("/dashboard/workspaces", verifyToken, async (req, res) => {
       const me = getUserIdentity(req);
       const { name, memberEmails = [] } = req.body || {};
-      if (!name?.trim()) return res.status(400).json({ error: "Workspace name is required" });
+      if (!name?.trim())
+        return res.status(400).json({ error: "Workspace name is required" });
 
       const members = [
-        { id: String(me.id), userId: String(me.id), name: me.name, email: me.email, role: "Owner" },
+        {
+          id: String(me.id),
+          userId: String(me.id),
+          name: me.name,
+          email: me.email,
+          role: "Owner",
+        },
       ];
 
       for (const raw of memberEmails) {
-        const email = String(raw || "").trim().toLowerCase();
-        if (!email || members.some((m) => m.email.toLowerCase() === email)) continue;
+        const email = String(raw || "")
+          .trim()
+          .toLowerCase();
+        if (!email || members.some((m) => m.email.toLowerCase() === email))
+          continue;
         members.push({
           id: new ObjectId().toString(),
           userId: "",
@@ -247,7 +308,11 @@ async function run() {
 
       const doc = {
         name: name.trim(),
-        slug: name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, ""),
+        slug: name
+          .trim()
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/(^-|-$)/g, ""),
         members,
         createdBy: String(me.id),
         createdAt: now(),
@@ -255,51 +320,97 @@ async function run() {
 
       const result = await workspacesCollection.insertOne(doc);
       res.status(201).json({
-        workspace: { id: String(result.insertedId), name: doc.name, slug: doc.slug, members: doc.members },
+        workspace: {
+          id: String(result.insertedId),
+          name: doc.name,
+          slug: doc.slug,
+          members: doc.members,
+        },
       });
     });
 
     // POST /dashboard/workspaces/:workspaceId/members
-    app.post("/dashboard/workspaces/:workspaceId/members", verifyToken, async (req, res) => {
+    app.post(
+      "/dashboard/workspaces/:workspaceId/members",
+      verifyToken,
+      async (req, res) => {
+        const { workspaceId } = req.params;
+        const { email, role = "Member" } = req.body || {};
+        const clean = String(email || "")
+          .trim()
+          .toLowerCase();
+        if (!clean)
+          return res.status(400).json({ error: "Member email is required" });
+
+        const workspace = await workspacesCollection.findOne({
+          _id: toId(workspaceId),
+        });
+        if (!workspace)
+          return res.status(404).json({ error: "Workspace not found" });
+
+        const exists = (workspace.members || []).find(
+          (m) => m.email.toLowerCase() === clean,
+        );
+        if (exists) return res.status(201).json({ member: exists });
+
+        const member = {
+          id: new ObjectId().toString(),
+          userId: "",
+          name: clean.split("@")[0],
+          email: clean,
+          role,
+        };
+
+        await workspacesCollection.updateOne(
+          { _id: toId(workspaceId) },
+          { $push: { members: member } },
+        );
+
+        res.status(201).json({ member });
+      },
+    );
+
+    app.delete("/dashboard/workspaces/:workspaceId", verifyToken, async (req, res) => {
       const { workspaceId } = req.params;
-      const { email, role = "Member" } = req.body || {};
-      const clean = String(email || "").trim().toLowerCase();
-      if (!clean) return res.status(400).json({ error: "Member email is required" });
+      const me = getUserIdentity(req);
 
       const workspace = await workspacesCollection.findOne({ _id: toId(workspaceId) });
       if (!workspace) return res.status(404).json({ error: "Workspace not found" });
 
-      const exists = (workspace.members || []).find((m) => m.email.toLowerCase() === clean);
-      if (exists) return res.status(201).json({ member: exists });
-
-      const member = {
-        id: new ObjectId().toString(),
-        userId: "",
-        name: clean.split("@")[0],
-        email: clean,
-        role,
-      };
-
-      await workspacesCollection.updateOne(
-        { _id: toId(workspaceId) },
-        { $push: { members: member } }
+      const isOwner = (workspace.members || []).some(
+        (m) => String(m.userId) === String(me.id) && m.role === "Owner"
       );
+      if (!isOwner) return res.status(403).json({ error: "Only owner can delete workspace" });
 
-      res.status(201).json({ member });
+      await projectsCollection.deleteMany({ workspaceId: toId(workspaceId) });
+      await tasksCollection.deleteMany({ workspaceId: toId(workspaceId) });
+      await workspacesCollection.deleteOne({ _id: toId(workspaceId) });
+
+      return res.json({ ok: true });
     });
 
     // POST /dashboard/projects
     app.post("/dashboard/projects", verifyToken, async (req, res) => {
       const { workspaceId, name, key = "" } = req.body || {};
-      if (!workspaceId || !name?.trim()) return res.status(400).json({ error: "workspaceId and project name are required" });
+      if (!workspaceId || !name?.trim())
+        return res
+          .status(400)
+          .json({ error: "workspaceId and project name are required" });
 
-      const workspace = await workspacesCollection.findOne({ _id: toId(workspaceId) });
-      if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+      const workspace = await workspacesCollection.findOne({
+        _id: toId(workspaceId),
+      });
+      if (!workspace)
+        return res.status(404).json({ error: "Workspace not found" });
 
       const project = {
         workspaceId: toId(workspaceId),
         name: name.trim(),
-        key: String(key || name).toUpperCase().replace(/[^A-Z0-9]+/g, "").slice(0, 6) || "PROJ",
+        key:
+          String(key || name)
+            .toUpperCase()
+            .replace(/[^A-Z0-9]+/g, "")
+            .slice(0, 6) || "PROJ",
         status: "active",
         createdAt: now(),
       };
@@ -319,19 +430,40 @@ async function run() {
 
     // POST /dashboard/tasks
     app.post("/dashboard/tasks", verifyToken, async (req, res) => {
-      const { workspaceId, projectId = "", title, description = "", priority = "P2", status = "todo", dueDate = "", assigneeId = "" } = req.body || {};
-      if (!workspaceId || !title?.trim()) return res.status(400).json({ error: "workspaceId and title are required" });
+      const {
+        workspaceId,
+        projectId = "",
+        title,
+        description = "",
+        priority = "P2",
+        status = "todo",
+        dueDate = "",
+        assigneeId = "",
+      } = req.body || {};
+      if (!workspaceId || !title?.trim())
+        return res
+          .status(400)
+          .json({ error: "workspaceId and title are required" });
 
-      const workspace = await workspacesCollection.findOne({ _id: toId(workspaceId) });
-      if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+      const workspace = await workspacesCollection.findOne({
+        _id: toId(workspaceId),
+      });
+      if (!workspace)
+        return res.status(404).json({ error: "Workspace not found" });
 
       let projectName = "";
       if (projectId) {
-        const project = await projectsCollection.findOne({ _id: toId(projectId), workspaceId: toId(workspaceId) });
+        const project = await projectsCollection.findOne({
+          _id: toId(projectId),
+          workspaceId: toId(workspaceId),
+        });
         projectName = project?.name || "";
       }
 
-      const assignee = (workspace.members || []).find((m) => m.id === assigneeId) || (workspace.members || [])[0] || null;
+      const assignee =
+        (workspace.members || []).find((m) => m.id === assigneeId) ||
+        (workspace.members || [])[0] ||
+        null;
 
       const task = {
         workspaceId: toId(workspaceId),
@@ -372,18 +504,29 @@ async function run() {
       const patch = req.body || {};
 
       const $set = {};
-      for (const k of ["title", "description", "priority", "status", "dueDate", "assigneeId", "assigneeName", "projectName"]) {
+      for (const k of [
+        "title",
+        "description",
+        "priority",
+        "status",
+        "dueDate",
+        "assigneeId",
+        "assigneeName",
+        "projectName",
+      ]) {
         if (typeof patch[k] === "string") $set[k] = patch[k];
       }
-      if (patch.projectId !== undefined) $set.projectId = patch.projectId ? toId(patch.projectId) : null;
+      if (patch.projectId !== undefined)
+        $set.projectId = patch.projectId ? toId(patch.projectId) : null;
 
       const result = await tasksCollection.findOneAndUpdate(
         { _id: toId(taskId) },
         { $set },
-        { returnDocument: "after" }
+        { returnDocument: "after" },
       );
 
-      if (!result.value) return res.status(404).json({ error: "Task not found" });
+      if (!result.value)
+        return res.status(404).json({ error: "Task not found" });
 
       const t = result.value;
       res.json({
@@ -405,17 +548,24 @@ async function run() {
     });
 
     // POST /dashboard/notifications/read-all
-    app.post("/dashboard/notifications/read-all", verifyToken, async (req, res) => {
-      const me = getUserIdentity(req);
-      await notificationsCollection.updateMany({ userId: String(me.id), read: false }, { $set: { read: true } });
-      res.json({ ok: true });
-    });
+    app.post(
+      "/dashboard/notifications/read-all",
+      verifyToken,
+      async (req, res) => {
+        const me = getUserIdentity(req);
+        await notificationsCollection.updateMany(
+          { userId: String(me.id), read: false },
+          { $set: { read: true } },
+        );
+        res.json({ ok: true });
+      },
+    );
 
     // Send a ping to confirm a successful connection
-    await client.db("admin").command({ ping: 1 });
-    console.log(
-      "Pinged your deployment. You successfully connected to MongoDB!",
-    );
+    // await client.db("admin").command({ ping: 1 });
+    // console.log(
+    //   "Pinged your deployment. You successfully connected to MongoDB!",
+    // );
   } finally {
     // Ensures that the client will close when you finish/error
     // await client.close();
@@ -430,3 +580,6 @@ app.get("/", (req, res) => {
 app.listen(port, () => {
   console.log(`Zyplo is listening on port ${port}`);
 });
+
+// const serverless = require("serverless-http");
+// module.exports = serverless(app);
