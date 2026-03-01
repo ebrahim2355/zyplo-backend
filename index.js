@@ -51,6 +51,7 @@ async function run() {
     //added for workspace
     const workspacesCollection = db.collection("workspaces");
     const projectsCollection = db.collection("projects");
+    const boardsCollection = db.collection("boards");
     const tasksCollection = db.collection("tasks");
     const notificationsCollection = db.collection("notifications");
 
@@ -66,6 +67,23 @@ async function run() {
       email: req.user?.email || req.headers["x-user-email"] || "",
       name: req.user?.name || req.headers["x-user-name"] || "User",
     });
+
+    const isWorkspaceMember = (workspace, me) => {
+      const myEmail = String(me?.email || "").toLowerCase();
+      return (workspace?.members || []).some(
+        (m) =>
+          String(m.userId || "") === String(me?.id || "") ||
+          (myEmail && String(m.email || "").toLowerCase() === myEmail),
+      );
+    };
+
+    const isValidId = (v) => ObjectId.isValid(String(v || ""));
+    const statusFromColumnName = (name) =>
+      String(name || "")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "_")
+        .replace(/^_+|_+$/g, "");
 
     app.post("/auth/register", async (req, res) => {
       try {
@@ -199,7 +217,7 @@ async function run() {
 
     // users api
 
-    app.get("/users", async (req, res) => { });
+    app.get("/users", async (req, res) => {});
 
     app.post("/users", async (req, res) => {
       const users = req.body;
@@ -253,6 +271,9 @@ async function run() {
           id: String(t._id),
           workspaceId: String(t.workspaceId),
           projectId: t.projectId ? String(t.projectId) : "",
+          boardId: t.boardId ? String(t.boardId) : "",
+          columnId: t.columnId ? String(t.columnId) : "",
+          order: Number.isInteger(t.order) ? t.order : 0,
           projectName: t.projectName || "",
           title: t.title,
           description: t.description || "",
@@ -370,24 +391,35 @@ async function run() {
       },
     );
 
-    app.delete("/dashboard/workspaces/:workspaceId", verifyToken, async (req, res) => {
-      const { workspaceId } = req.params;
-      const me = getUserIdentity(req);
+    app.delete(
+      "/dashboard/workspaces/:workspaceId",
+      verifyToken,
+      async (req, res) => {
+        const { workspaceId } = req.params;
+        const me = getUserIdentity(req);
 
-      const workspace = await workspacesCollection.findOne({ _id: toId(workspaceId) });
-      if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+        const workspace = await workspacesCollection.findOne({
+          _id: toId(workspaceId),
+        });
+        if (!workspace)
+          return res.status(404).json({ error: "Workspace not found" });
 
-      const isOwner = (workspace.members || []).some(
-        (m) => String(m.userId) === String(me.id) && m.role === "Owner"
-      );
-      if (!isOwner) return res.status(403).json({ error: "Only owner can delete workspace" });
+        const isOwner = (workspace.members || []).some(
+          (m) => String(m.userId) === String(me.id) && m.role === "Owner",
+        );
+        if (!isOwner)
+          return res
+            .status(403)
+            .json({ error: "Only owner can delete workspace" });
 
-      await projectsCollection.deleteMany({ workspaceId: toId(workspaceId) });
-      await tasksCollection.deleteMany({ workspaceId: toId(workspaceId) });
-      await workspacesCollection.deleteOne({ _id: toId(workspaceId) });
+        await projectsCollection.deleteMany({ workspaceId: toId(workspaceId) });
+        await boardsCollection.deleteMany({ workspaceId: toId(workspaceId) });
+        await tasksCollection.deleteMany({ workspaceId: toId(workspaceId) });
+        await workspacesCollection.deleteOne({ _id: toId(workspaceId) });
 
-      return res.json({ ok: true });
-    });
+        return res.json({ ok: true });
+      },
+    );
 
     // POST /dashboard/projects
     app.post("/dashboard/projects", verifyToken, async (req, res) => {
@@ -396,12 +428,18 @@ async function run() {
         return res
           .status(400)
           .json({ error: "workspaceId and project name are required" });
+      if (!isValidId(workspaceId))
+        return res.status(400).json({ error: "Invalid workspaceId" });
 
       const workspace = await workspacesCollection.findOne({
         _id: toId(workspaceId),
       });
       if (!workspace)
         return res.status(404).json({ error: "Workspace not found" });
+
+      const me = getUserIdentity(req);
+      if (!isWorkspaceMember(workspace, me))
+        return res.status(403).json({ error: "Forbidden workspace access" });
 
       const project = {
         workspaceId: toId(workspaceId),
@@ -415,15 +453,58 @@ async function run() {
         createdAt: now(),
       };
 
-      const result = await projectsCollection.insertOne(project);
+      const defaultColumns = [
+        { _id: new ObjectId(), name: "To Do", order: 0 },
+        { _id: new ObjectId(), name: "In Progress", order: 1 },
+        { _id: new ObjectId(), name: "In Review", order: 2 },
+        { _id: new ObjectId(), name: "Done", order: 3 },
+      ];
+
+      const session = client.startSession();
+      let createdProjectId = null;
+      let createdBoardId = null;
+
+      try {
+        await session.withTransaction(async () => {
+          const projectResult = await projectsCollection.insertOne(project, {
+            session,
+          });
+          createdProjectId = projectResult.insertedId;
+
+          const boardDoc = {
+            workspaceId: toId(workspaceId),
+            projectId: createdProjectId,
+            name: "Default Board",
+            columns: defaultColumns,
+            createdAt: now(),
+          };
+
+          const boardResult = await boardsCollection.insertOne(boardDoc, {
+            session,
+          });
+          createdBoardId = boardResult.insertedId;
+        });
+      } finally {
+        await session.endSession();
+      }
+
       res.status(201).json({
         project: {
-          id: String(result.insertedId),
+          id: String(createdProjectId),
           workspaceId: String(project.workspaceId),
           name: project.name,
           key: project.key,
           status: project.status,
           createdAt: project.createdAt,
+        },
+        board: {
+          id: String(createdBoardId),
+          name: "Default Board",
+          columns: defaultColumns.map((c) => ({
+            id: String(c._id),
+            name: c.name,
+            order: c.order,
+          })),
         },
       });
     });
@@ -433,6 +514,8 @@ async function run() {
       const {
         workspaceId,
         projectId = "",
+        boardId = "",
+        columnId = "",
         title,
         description = "",
         priority = "P2",
@@ -440,10 +523,21 @@ async function run() {
         dueDate = "",
         assigneeId = "",
       } = req.body || {};
-      if (!workspaceId || !title?.trim())
-        return res
-          .status(400)
-          .json({ error: "workspaceId and title are required" });
+      if (!workspaceId || !projectId || !boardId || !columnId || !title?.trim())
+        return res.status(400).json({
+          error:
+            "workspaceId, projectId, boardId, columnId and title are required",
+        });
+      if (
+        !isValidId(workspaceId) ||
+        !isValidId(projectId) ||
+        !isValidId(boardId) ||
+        !isValidId(columnId)
+      ) {
+        return res.status(400).json({
+          error: "workspaceId, projectId, boardId or columnId is invalid",
+        });
+      }
 
       const workspace = await workspacesCollection.findOne({
         _id: toId(workspaceId),
@@ -451,24 +545,59 @@ async function run() {
       if (!workspace)
         return res.status(404).json({ error: "Workspace not found" });
 
-      let projectName = "";
-      if (projectId) {
-        const project = await projectsCollection.findOne({
-          _id: toId(projectId),
-          workspaceId: toId(workspaceId),
-        });
-        projectName = project?.name || "";
-      }
+      const me = getUserIdentity(req);
+      if (!isWorkspaceMember(workspace, me))
+        return res.status(403).json({ error: "Forbidden workspace access" });
+
+      const project = await projectsCollection.findOne({
+        _id: toId(projectId),
+        workspaceId: toId(workspaceId),
+      });
+      if (!project)
+        return res
+          .status(404)
+          .json({ error: "Project not found in this workspace" });
+
+      const board = await boardsCollection.findOne({
+        _id: toId(boardId),
+        workspaceId: toId(workspaceId),
+        projectId: toId(projectId),
+      });
+      if (!board) return res.status(404).json({ error: "Board not found" });
+
+      const hasColumn = (board.columns || []).some(
+        (c) => String(c._id) === String(toId(columnId)),
+      );
+      if (!hasColumn)
+        return res.status(400).json({ error: "Invalid columnId for board" });
 
       const assignee =
         (workspace.members || []).find((m) => m.id === assigneeId) ||
         (workspace.members || [])[0] ||
         null;
 
+      const lastTask = await tasksCollection
+        .find({
+          workspaceId: toId(workspaceId),
+          projectId: toId(projectId),
+          boardId: toId(boardId),
+          columnId: toId(columnId),
+        })
+        .sort({ order: -1 })
+        .limit(1)
+        .toArray();
+      const nextOrder =
+        lastTask.length > 0 && Number.isInteger(lastTask[0].order)
+          ? lastTask[0].order + 1
+          : 0;
+
       const task = {
         workspaceId: toId(workspaceId),
-        projectId: projectId ? toId(projectId) : null,
-        projectName,
+        projectId: toId(projectId),
+        boardId: toId(boardId),
+        columnId: toId(columnId),
+        order: nextOrder,
+        projectName: project.name,
         title: title.trim(),
         description,
         priority,
@@ -484,8 +613,11 @@ async function run() {
         task: {
           id: String(result.insertedId),
           workspaceId,
-          projectId: projectId || "",
-          projectName,
+          projectId: String(task.projectId),
+          boardId: String(task.boardId),
+          columnId: String(task.columnId),
+          order: task.order,
+          projectName: task.projectName,
           title: task.title,
           description: task.description,
           priority: task.priority,
@@ -498,10 +630,394 @@ async function run() {
       });
     });
 
+    // new api for board
+    app.get("/dashboard/boards/:projectId", verifyToken, async (req, res) => {
+      const { projectId } = req.params;
+      const me = getUserIdentity(req);
+      if (!isValidId(projectId))
+        return res.status(400).json({ error: "Invalid projectId" });
+
+      const project = await projectsCollection.findOne({
+        _id: toId(projectId),
+      });
+      if (!project) return res.status(404).json({ error: "Project not found" });
+
+      const workspace = await workspacesCollection.findOne({
+        _id: toId(project.workspaceId),
+      });
+      if (!workspace)
+        return res.status(404).json({ error: "Workspace not found" });
+      if (!isWorkspaceMember(workspace, me))
+        return res.status(403).json({ error: "Forbidden workspace access" });
+
+      const board = await boardsCollection.findOne({
+        projectId: toId(projectId),
+        workspaceId: toId(project.workspaceId),
+      });
+      if (!board) return res.status(404).json({ error: "Board not found" });
+
+      const sortedColumns = [...(board.columns || [])].sort(
+        (a, b) => Number(a.order || 0) - Number(b.order || 0),
+      );
+      const tasks = await tasksCollection
+        .find({ boardId: toId(board._id), projectId: toId(projectId) })
+        .sort({ order: 1, createdAt: 1 })
+        .toArray();
+
+      const columns = sortedColumns.map((col) => ({
+        id: String(col._id),
+        name: col.name,
+        order: Number(col.order || 0),
+        tasks: tasks
+          .filter((t) => String(t.columnId) === String(col._id))
+          .sort((a, b) => Number(a.order || 0) - Number(b.order || 0))
+          .map((t) => ({
+            id: String(t._id),
+            workspaceId: String(t.workspaceId),
+            projectId: t.projectId ? String(t.projectId) : "",
+            boardId: t.boardId ? String(t.boardId) : "",
+            columnId: t.columnId ? String(t.columnId) : "",
+            order: Number(t.order || 0),
+            projectName: t.projectName || "",
+            title: t.title,
+            description: t.description || "",
+            priority: t.priority || "P2",
+            status: t.status || "todo",
+            dueDate: t.dueDate || "",
+            assigneeId: t.assigneeId || "",
+            assigneeName: t.assigneeName || "Unassigned",
+            createdAt: t.createdAt,
+          })),
+      }));
+
+      return res.json({
+        board: {
+          id: String(board._id),
+          workspaceId: String(board.workspaceId),
+          projectId: String(board.projectId),
+          name: board.name,
+          createdAt: board.createdAt,
+        },
+        columns,
+      });
+    });
+
+    app.patch(
+      "/dashboard/tasks/:taskId/move",
+      verifyToken,
+      async (req, res) => {
+        const { taskId } = req.params;
+        const {
+          sourceColumnId,
+          destinationColumnId,
+          destinationBoardId = "",
+          newOrder,
+          status,
+        } = req.body || {};
+
+        if (
+          !taskId ||
+          !sourceColumnId ||
+          !destinationColumnId ||
+          !Number.isInteger(newOrder) ||
+          newOrder < 0
+        ) {
+          return res.status(400).json({
+            error:
+              "taskId, sourceColumnId, destinationColumnId and non-negative integer newOrder are required",
+          });
+        }
+        if (
+          !isValidId(taskId) ||
+          !isValidId(sourceColumnId) ||
+          !isValidId(destinationColumnId)
+        ) {
+          return res.status(400).json({
+            error: "taskId, sourceColumnId or destinationColumnId is invalid",
+          });
+        }
+        if (destinationBoardId && !isValidId(destinationBoardId)) {
+          return res.status(400).json({
+            error: "destinationBoardId is invalid",
+          });
+        }
+
+        const me = getUserIdentity(req);
+        const session = client.startSession();
+
+        try {
+          let responsePayload = null;
+
+          await session.withTransaction(async () => {
+            const task = await tasksCollection.findOne(
+              { _id: toId(taskId) },
+              { session },
+            );
+            if (!task) throw { status: 404, message: "Task not found" };
+            if (!task.workspaceId || !task.projectId || !task.boardId) {
+              throw { status: 400, message: "Task is not linked to a board" };
+            }
+
+            if (String(task.columnId) !== String(toId(sourceColumnId))) {
+              throw {
+                status: 400,
+                message: "sourceColumnId does not match current task columnId",
+              };
+            }
+
+            const workspace = await workspacesCollection.findOne(
+              { _id: toId(task.workspaceId) },
+              { session },
+            );
+            if (!workspace)
+              throw { status: 404, message: "Workspace not found" };
+            if (!isWorkspaceMember(workspace, me)) {
+              throw { status: 403, message: "Forbidden workspace access" };
+            }
+
+            const project = await projectsCollection.findOne(
+              {
+                _id: toId(task.projectId),
+                workspaceId: toId(task.workspaceId),
+              },
+              { session },
+            );
+            if (!project)
+              throw { status: 404, message: "Project not found in workspace" };
+
+            const sourceBoard = await boardsCollection.findOne(
+              {
+                _id: toId(task.boardId),
+                workspaceId: toId(task.workspaceId),
+                projectId: toId(task.projectId),
+              },
+              { session },
+            );
+            const sourceId = toId(sourceColumnId);
+            if (!sourceBoard) throw { status: 404, message: "Board not found" };
+
+            const sourceBoardColumnIds = new Set(
+              (sourceBoard.columns || []).map((c) => String(c._id)),
+            );
+            if (!sourceBoardColumnIds.has(String(sourceId))) {
+              throw { status: 400, message: "Invalid source column for board" };
+            }
+
+            const targetBoardId = destinationBoardId
+              ? toId(destinationBoardId)
+              : toId(task.boardId);
+            const destinationBoard =
+              String(targetBoardId) === String(sourceBoard._id)
+                ? sourceBoard
+                : await boardsCollection.findOne(
+                    {
+                      _id: targetBoardId,
+                      workspaceId: toId(task.workspaceId),
+                      projectId: toId(task.projectId),
+                    },
+                    { session },
+                  );
+            if (!destinationBoard) {
+              throw { status: 404, message: "Destination board not found" };
+            }
+
+            const destinationId = toId(destinationColumnId);
+            const destinationBoardColumnIds = new Set(
+              (destinationBoard.columns || []).map((c) => String(c._id)),
+            );
+            if (!destinationBoardColumnIds.has(String(destinationId))) {
+              throw {
+                status: 400,
+                message: "Invalid destination column for destination board",
+              };
+            }
+
+            const destinationColumn = (destinationBoard.columns || []).find(
+              (c) => String(c._id) === String(destinationId),
+            );
+            const explicitStatus =
+              typeof status === "string" ? status.trim() : "";
+            const nextStatus =
+              explicitStatus ||
+              statusFromColumnName(destinationColumn?.name) ||
+              task.status ||
+              "todo";
+
+            const sameBoard = String(sourceBoard._id) === String(targetBoardId);
+            const sameColumn =
+              sameBoard && String(sourceId) === String(destinationId);
+
+            const sourceTasksWithoutMoved = await tasksCollection
+              .find(
+                {
+                  boardId: toId(sourceBoard._id),
+                  columnId: sourceId,
+                  _id: { $ne: toId(taskId) },
+                },
+                { session },
+              )
+              .sort({ order: 1, createdAt: 1 })
+              .toArray();
+
+            const ops = [];
+
+            if (sameColumn) {
+              const insertAt = Math.min(
+                newOrder,
+                sourceTasksWithoutMoved.length,
+              );
+              const reordered = [...sourceTasksWithoutMoved];
+              reordered.splice(insertAt, 0, task);
+
+              reordered.forEach((t, index) => {
+                const $set = { order: index };
+                if (String(t._id) === String(task._id) && explicitStatus) {
+                  $set.status = nextStatus;
+                }
+                ops.push({
+                  updateOne: {
+                    filter: { _id: toId(t._id) },
+                    update: { $set },
+                  },
+                });
+              });
+            } else {
+              const destinationTasks = await tasksCollection
+                .find(
+                  { boardId: targetBoardId, columnId: destinationId },
+                  { session },
+                )
+                .sort({ order: 1, createdAt: 1 })
+                .toArray();
+
+              sourceTasksWithoutMoved.forEach((t, index) => {
+                ops.push({
+                  updateOne: {
+                    filter: { _id: toId(t._id) },
+                    update: { $set: { order: index } },
+                  },
+                });
+              });
+
+              const insertAt = Math.min(newOrder, destinationTasks.length);
+              const destinationReordered = [...destinationTasks];
+              destinationReordered.splice(insertAt, 0, {
+                ...task,
+                boardId: targetBoardId,
+                columnId: destinationId,
+                status: nextStatus,
+              });
+
+              destinationReordered.forEach((t, index) => {
+                if (String(t._id) === String(task._id)) {
+                  ops.push({
+                    updateOne: {
+                      filter: { _id: toId(task._id) },
+                      update: {
+                        $set: {
+                          boardId: targetBoardId,
+                          columnId: destinationId,
+                          order: index,
+                          status: nextStatus,
+                        },
+                      },
+                    },
+                  });
+                } else {
+                  ops.push({
+                    updateOne: {
+                      filter: { _id: toId(t._id) },
+                      update: { $set: { order: index } },
+                    },
+                  });
+                }
+              });
+            }
+
+            if (ops.length > 0) {
+              await tasksCollection.bulkWrite(ops, { session });
+            }
+
+            const responseBoard = destinationBoard;
+            const sortedColumns = [...(responseBoard.columns || [])].sort(
+              (a, b) => Number(a.order || 0) - Number(b.order || 0),
+            );
+            const boardTasks = await tasksCollection
+              .find(
+                {
+                  boardId: toId(responseBoard._id),
+                  workspaceId: toId(task.workspaceId),
+                  projectId: toId(task.projectId),
+                },
+                { session },
+              )
+              .sort({ order: 1, createdAt: 1 })
+              .toArray();
+
+            responsePayload = {
+              boardId: String(responseBoard._id),
+              projectId: String(project._id),
+              workspaceId: String(workspace._id),
+              columns: sortedColumns.map((col) => ({
+                id: String(col._id),
+                name: col.name,
+                order: Number(col.order || 0),
+                tasks: boardTasks
+                  .filter((t) => String(t.columnId) === String(col._id))
+                  .sort((a, b) => Number(a.order || 0) - Number(b.order || 0))
+                  .map((t) => ({
+                    id: String(t._id),
+                    workspaceId: String(t.workspaceId),
+                    projectId: t.projectId ? String(t.projectId) : "",
+                    boardId: t.boardId ? String(t.boardId) : "",
+                    columnId: t.columnId ? String(t.columnId) : "",
+                    order: Number(t.order || 0),
+                    projectName: t.projectName || "",
+                    title: t.title,
+                    description: t.description || "",
+                    priority: t.priority || "P2",
+                    status: t.status || "todo",
+                    dueDate: t.dueDate || "",
+                    assigneeId: t.assigneeId || "",
+                    assigneeName: t.assigneeName || "Unassigned",
+                    createdAt: t.createdAt,
+                  })),
+              })),
+            };
+          });
+
+          return res.json(responsePayload);
+        } catch (error) {
+          if (error?.status && error?.message) {
+            return res.status(error.status).json({ error: error.message });
+          }
+          console.error(error);
+          return res.status(500).json({ error: "Failed to move task" });
+        } finally {
+          await session.endSession();
+        }
+      },
+    );
+
     // PATCH /dashboard/tasks/:taskId
     app.patch("/dashboard/tasks/:taskId", verifyToken, async (req, res) => {
       const { taskId } = req.params;
       const patch = req.body || {};
+      const me = getUserIdentity(req);
+      if (!isValidId(taskId))
+        return res.status(400).json({ error: "Invalid taskId" });
+
+      const existingTask = await tasksCollection.findOne({ _id: toId(taskId) });
+      if (!existingTask)
+        return res.status(404).json({ error: "Task not found" });
+
+      const workspace = await workspacesCollection.findOne({
+        _id: toId(existingTask.workspaceId),
+      });
+      if (!workspace)
+        return res.status(404).json({ error: "Workspace not found" });
+      if (!isWorkspaceMember(workspace, me))
+        return res.status(403).json({ error: "Forbidden workspace access" });
 
       const $set = {};
       for (const k of [
@@ -516,8 +1032,23 @@ async function run() {
       ]) {
         if (typeof patch[k] === "string") $set[k] = patch[k];
       }
-      if (patch.projectId !== undefined)
-        $set.projectId = patch.projectId ? toId(patch.projectId) : null;
+      if (patch.projectId !== undefined) {
+        if (!patch.projectId) {
+          $set.projectId = null;
+        } else {
+          if (!isValidId(patch.projectId))
+            return res.status(400).json({ error: "Invalid projectId" });
+          const nextProject = await projectsCollection.findOne({
+            _id: toId(patch.projectId),
+            workspaceId: toId(existingTask.workspaceId),
+          });
+          if (!nextProject)
+            return res
+              .status(404)
+              .json({ error: "Project not found in this workspace" });
+          $set.projectId = toId(patch.projectId);
+        }
+      }
 
       const result = await tasksCollection.findOneAndUpdate(
         { _id: toId(taskId) },
@@ -534,6 +1065,9 @@ async function run() {
           id: String(t._id),
           workspaceId: String(t.workspaceId),
           projectId: t.projectId ? String(t.projectId) : "",
+          boardId: t.boardId ? String(t.boardId) : "",
+          columnId: t.columnId ? String(t.columnId) : "",
+          order: Number.isInteger(t.order) ? t.order : 0,
           projectName: t.projectName || "",
           title: t.title,
           description: t.description || "",
