@@ -74,6 +74,33 @@ async function run() {
       String(value || "")
         .trim()
         .toLowerCase();
+    // Basic Resend sender using .env keys.
+    const sendResendEmail = async ({ to, subject, html }) => {
+      if (!process.env.RESEND_API_KEY || !process.env.RESEND_FROM_EMAIL) {
+        throw new Error("Missing RESEND_API_KEY or RESEND_FROM_EMAIL");
+      }
+
+      const response = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          from: process.env.RESEND_FROM_EMAIL,
+          to,
+          subject,
+          html,
+        }),
+      });
+
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data?.message || "Email send failed");
+      }
+
+      return data;
+    };
 
     const getUserIdentity = (req) => ({
       id: req.user?.id || req.headers["x-user-id"],
@@ -82,10 +109,11 @@ async function run() {
     });
 
     const isWorkspaceMember = (workspace, me) => {
+      const myId = String(me?.id || "");
       const myEmail = normalizeEmail(me?.email);
       return (workspace?.members || []).some(
         (m) =>
-          String(m.userId || "") === String(me?.id || "") ||
+          (myId && String(m.userId || "") === myId) ||
           (myEmail && normalizeEmail(m.email) === myEmail),
       );
     };
@@ -1236,6 +1264,39 @@ async function run() {
 
         // send invite data to db
         const result = await inviteCollection.insertOne(inviteData);
+
+        // After invite data is stored, send invite email via Resend.
+        try {
+          await sendResendEmail({
+            to: email,
+            subject: "You are invited to a workspace",
+            html: `
+              <div style="margin:0;padding:24px;background:#f3f6fb;font-family:Arial,sans-serif;color:#1f2937;">
+                <div style="max-width:560px;margin:0 auto;background:#ffffff;border:1px solid #e5e7eb;border-radius:12px;padding:24px;">
+                  <h2 style="margin:0 0 12px;font-size:20px;line-height:1.3;color:#111827;">You're invited to join a workspace</h2>
+                  <p style="margin:0 0 10px;font-size:14px;line-height:1.6;color:#374151;">
+                    You have been invited as <strong style="text-transform:capitalize;">${role}</strong>.
+                  </p>
+                  <p style="margin:0 0 18px;font-size:14px;line-height:1.6;color:#374151;">
+                    Click below to accept your invitation.
+                  </p>
+                  <a href="${inviteLink}" style="display:inline-block;background:#4f46e5;color:#ffffff;text-decoration:none;font-size:14px;font-weight:600;padding:10px 16px;border-radius:8px;">
+                    Accept Invitation
+                  </a>
+                  <p style="margin:18px 0 6px;font-size:12px;line-height:1.5;color:#6b7280;">
+                    If the button does not work, use this link:
+                  </p>
+                  <p style="margin:0;font-size:12px;line-height:1.5;word-break:break-all;">
+                    <a href="${inviteLink}" style="color:#4f46e5;text-decoration:underline;">${inviteLink}</a>
+                  </p>
+                </div>
+              </div>
+            `,
+          });
+        } catch (mailError) {
+          // Keep invite creation successful even if email sending fails.
+          console.error("Resend send failed:", mailError?.message || mailError);
+        }
 
         // send response to frontend
         return res.status(201).json({
