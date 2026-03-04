@@ -5,6 +5,8 @@ const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const app = express();
 require("dotenv").config();
 const jwt = require("jsonwebtoken");
+const { z } = require("zod");
+const crypto = require("crypto");
 const port = process.env.PORT || 5000;
 
 setServers(["1.1.1.1", "8.8.8.8"]);
@@ -41,6 +43,12 @@ const verifyToken = (req, res, next) => {
   }
 };
 
+// Zod Schema -> Invite Member (Rifat)
+const inviteSchema = z.object({
+  email: z.email(),
+  role: z.enum(["admin", "member"]),
+});
+
 async function run() {
   try {
     // Connect the client to the server	(optional starting in v4.7)
@@ -54,6 +62,7 @@ async function run() {
     const boardsCollection = db.collection("boards");
     const tasksCollection = db.collection("tasks");
     const notificationsCollection = db.collection("notifications");
+    const inviteCollection = db.collection("invites");
 
     // register api
     const bcrypt = require("bcryptjs");
@@ -61,6 +70,10 @@ async function run() {
     // New variables
     const toId = (v) => new ObjectId(String(v));
     const now = () => new Date().toISOString();
+    const normalizeEmail = (value) =>
+      String(value || "")
+        .trim()
+        .toLowerCase();
 
     const getUserIdentity = (req) => ({
       id: req.user?.id || req.headers["x-user-id"],
@@ -69,11 +82,11 @@ async function run() {
     });
 
     const isWorkspaceMember = (workspace, me) => {
-      const myEmail = String(me?.email || "").toLowerCase();
+      const myEmail = normalizeEmail(me?.email);
       return (workspace?.members || []).some(
         (m) =>
           String(m.userId || "") === String(me?.id || "") ||
-          (myEmail && String(m.email || "").toLowerCase() === myEmail),
+          (myEmail && normalizeEmail(m.email) === myEmail),
       );
     };
 
@@ -148,7 +161,7 @@ async function run() {
     });
 
     // login api
-    const jwt = require("jsonwebtoken");
+    const jwt = require("jsonwebtoken"); //DUPLICATE REQUIRE
 
     const MAX_LOGIN_ATTEMPTS = 5;
     const LOCK_TIME = 30 * 1000;
@@ -228,6 +241,7 @@ async function run() {
     // GET /dashboard/bootstrap
     app.get("/dashboard/bootstrap", verifyToken, async (req, res) => {
       const me = getUserIdentity(req);
+      console.log(me);
       if (!me.id) return res.status(401).json({ error: "Unauthorized" });
 
       const workspaceDocs = await workspacesCollection
@@ -308,15 +322,13 @@ async function run() {
           userId: String(me.id),
           name: me.name,
           email: me.email,
-          role: "Owner",
+          role: "admin", //changed to admin
         },
       ];
 
       for (const raw of memberEmails) {
-        const email = String(raw || "")
-          .trim()
-          .toLowerCase();
-        if (!email || members.some((m) => m.email.toLowerCase() === email))
+        const email = normalizeEmail(raw);
+        if (!email || members.some((m) => normalizeEmail(m.email) === email))
           continue;
         members.push({
           id: new ObjectId().toString(),
@@ -357,9 +369,7 @@ async function run() {
       async (req, res) => {
         const { workspaceId } = req.params;
         const { email, role = "Member" } = req.body || {};
-        const clean = String(email || "")
-          .trim()
-          .toLowerCase();
+        const clean = normalizeEmail(email);
         if (!clean)
           return res.status(400).json({ error: "Member email is required" });
 
@@ -370,7 +380,7 @@ async function run() {
           return res.status(404).json({ error: "Workspace not found" });
 
         const exists = (workspace.members || []).find(
-          (m) => m.email.toLowerCase() === clean,
+          (m) => normalizeEmail(m.email) === clean,
         );
         if (exists) return res.status(201).json({ member: exists });
 
@@ -404,13 +414,13 @@ async function run() {
         if (!workspace)
           return res.status(404).json({ error: "Workspace not found" });
 
-        const isOwner = (workspace.members || []).some(
-          (m) => String(m.userId) === String(me.id) && m.role === "Owner",
+        const isAdmin = (workspace.members || []).some(
+          (m) => String(m.userId) === String(me.id) && m.role === "admin",
         );
-        if (!isOwner)
+        if (!isAdmin)
           return res
             .status(403)
-            .json({ error: "Only owner can delete workspace" });
+            .json({ error: "Only admin can delete workspace" });
 
         await projectsCollection.deleteMany({ workspaceId: toId(workspaceId) });
         await boardsCollection.deleteMany({ workspaceId: toId(workspaceId) });
@@ -1094,6 +1104,415 @@ async function run() {
         res.json({ ok: true });
       },
     );
+
+    // Invite Feature--------->Rifat_START
+
+    // get all invites for a workspace.
+    app.get("/workspaces/:workspaceId/invites", async (req, res) => {
+      try {
+        const { workspaceId } = req.params;
+
+        // isValidId--> checks valid workspaceId
+        if (!isValidId(workspaceId)) {
+          return res
+            .status(400)
+            .json({ ok: false, message: "Invalid workspace id" });
+        }
+
+        // find the workspace
+        // toId--> converts to ObjectId
+        const workspace = await workspacesCollection.findOne({
+          _id: toId(workspaceId),
+        });
+        if (!workspace) {
+          return res
+            .status(404)
+            .json({ ok: false, message: "Workspace not found" });
+        }
+
+        // finds all invites under a workspace
+        const invites = await inviteCollection
+          .find({ workspaceId })
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        // UI-friendly response: include workspace.members with id/name/email/role.
+        return res.json({
+          ok: true,
+          workspace: {
+            id: String(workspace._id),
+            name: workspace.name,
+            // workspace members are in a arr
+            members: (workspace.members || []).map((member) => ({
+              id: member.id || member.userId || new ObjectId().toString(),
+              name:
+                member.name ||
+                (member.email ? member.email.split("@")[0] : "Member"),
+              email: member.email || "",
+              role: member.role || "Member",
+            })),
+          },
+          invites,
+        });
+      } catch (error) {
+        console.error(error);
+        return res.status(500).json({ ok: false, message: "Server error" });
+      }
+    });
+
+    // post invites
+    app.post("/workspaces/:workspaceId/invites", async (req, res) => {
+      try {
+        const clientSideData = inviteSchema.parse(req.body);
+        const role = clientSideData.role;
+        const email = normalizeEmail(clientSideData.email);
+        const { workspaceId } = req.params;
+
+        // Checks valid workspace
+        if (!isValidId(workspaceId)) {
+          return res
+            .status(400)
+            .json({ ok: false, message: "Invalid workspace id" });
+        }
+        // find the workspace
+        const workspace = await workspacesCollection.findOne({
+          _id: toId(workspaceId),
+        });
+
+        if (!workspace) {
+          return res
+            .status(404)
+            .json({ ok: false, message: "Workspace not found" });
+        }
+        // generate random token for URL and hashed version for DB
+        const rawToken = crypto.randomBytes(32).toString("hex");
+        const hashedToken = crypto
+          .createHash("sha256")
+          .update(rawToken)
+          .digest("hex");
+
+        // Create a Link to send via Email/Console
+        const frontendURL = process.env.FRONTEND_URL || "http://localhost:3000";
+        const inviteLink = `${frontendURL}/accept-invite/${rawToken}`;
+
+        // find if the user is already a member
+        const existingMember = isWorkspaceMember(workspace, { id: "", email });
+
+        // do this if found in existing workspace
+        if (existingMember) {
+          return res.status(409).json({
+            ok: false,
+            message: "User is already in workspace",
+          });
+        }
+
+        // find if the user is already invited
+        const existingInvite = await inviteCollection.findOne({
+          email,
+          workspaceId,
+          status: "pending",
+          expiresAt: { $gt: new Date() },
+        });
+
+        // do this if found in existing db
+        if (existingInvite) {
+          return res.status(409).json({
+            ok: false,
+            message: "Invite already sent",
+            expiresAt: existingInvite.expiresAt,
+          });
+        }
+
+        //  invite data for db
+        const inviteData = {
+          email,
+          role,
+          workspaceId,
+          status: "pending",
+          token: hashedToken,
+          createdAt: new Date(),
+          expiresAt: new Date(Date.now() + 2 * 24 * 60 * 60 * 1000),
+        };
+
+        // send invite data to db
+        const result = await inviteCollection.insertOne(inviteData);
+
+        // send response to frontend
+        return res.status(201).json({
+          ok: true,
+          inviteLink,
+          message: "Invite created!",
+          status: inviteData.status,
+          expiresAt: inviteData.expiresAt,
+        });
+      } catch (error) {
+        // catch zod error
+        if (error instanceof z.ZodError) {
+          return res.status(400).json({
+            ok: false,
+            message: "Validation failed",
+            errors: error,
+          });
+        }
+        // catch and send other error
+        console.error(error);
+        return res.status(500).json({ ok: false, message: "Server error" });
+      }
+    });
+
+    // check valid invitation
+    app.get("/invites/:token", async (req, res) => {
+      try {
+        const { token } = req.params;
+
+        const hashedToken = crypto
+          .createHash("sha256")
+          .update(token)
+          .digest("hex");
+
+        // check token existence in db
+        const findInvite = await inviteCollection.findOne({
+          token: hashedToken,
+        });
+
+        // if not found --> Invalid token
+        if (!findInvite)
+          return res.status(404).json({ message: "Invalid Token", ok: false });
+
+        // check for invite status
+        if (findInvite.status !== "pending")
+          return res
+            .status(409)
+            .json({ message: "Invite has been used", ok: false });
+
+        //  check for invite expiry
+        if (findInvite.expiresAt < new Date())
+          return res
+            .status(400)
+            .json({ message: "Invite has been expired!", ok: false });
+
+        //return response to frontend
+        return res.json({
+          ok: true,
+          invite: {
+            inviteeEmail: findInvite.email,
+            role: findInvite.role,
+            status: findInvite.status,
+            expiresAt: findInvite.expiresAt,
+            workspace: findInvite.workspaceId,
+          },
+          expired: false,
+        });
+      } catch (error) {
+        console.error(error);
+        return res.status(500).json({ ok: false, message: "Server error" });
+      }
+    });
+
+    // accept invitation and update workspace member
+    app.post("/invites/:choice", async (req, res) => {
+      const { choice } = req.params;
+      const { token, email } = req.body;
+
+      // check if token is sent
+      if (!token)
+        return res.status(400).json({ message: "Invalid Token", ok: false });
+
+      // choice = accept/reject -> accept adds the invitee to db & reject 'revoke' the invitee status
+      // accept validation check
+      if (choice !== "accept" && choice !== "reject") {
+        return res.status(400).json({
+          ok: false,
+          message: "Invalid option",
+        });
+      }
+
+      // again...token hash
+      const hashedToken = crypto
+        .createHash("sha256")
+        .update(token)
+        .digest("hex");
+
+      // revoke invitee status
+      if (choice === "reject") {
+        const findInvitee = await inviteCollection.findOneAndUpdate(
+          // find valid invitee by token, status & expires at
+          {
+            token: hashedToken,
+            status: "pending",
+            expiresAt: { $gt: new Date() },
+          },
+          // update status --> revoked, add revoked date
+          {
+            $set: {
+              status: "revoked",
+              revokedAt: new Date(),
+            },
+          },
+          // return updated document
+          {
+            returnDocument: "after",
+          },
+        );
+
+        // if revoking fails for some reason
+        if (!findInvitee.value) {
+          return res.status(404).json({
+            ok: false,
+            message: "Invite not found or already processed",
+          });
+        }
+
+        // revoking response sent to frontend
+        return res
+          .status(200)
+          .json({ message: "Invitation Rejected/Revoked", ok: true });
+      }
+
+      //  Now if the user accept the invitation...
+      const userEmail = normalizeEmail(email);
+
+      // find the invitation
+      const findInvite = await inviteCollection.findOne({
+        token: hashedToken,
+        status: "pending",
+      });
+
+      //  if the invitation is not found
+      if (!findInvite)
+        return res
+          .status(404)
+          .json({ message: "Invite Not Found!", ok: false });
+
+      // if the invitation is expired...
+      if (findInvite.expiresAt < new Date()) {
+        return res.status(400).json({
+          message: "Invite has been expired!",
+          ok: false,
+        });
+      }
+
+      console.log("invitee:" + findInvite.email, "auth:" + userEmail);
+      // if invitee email and user email doesn't match
+      if (normalizeEmail(findInvite.email) !== userEmail)
+        return res.status(403).json({
+          message: `Please use ${findInvite.email} to accept the invitation `,
+          ok: false,
+        });
+      // I don't think this block needs to exist because we already verify it once when the user is invited
+      const workspaceFilter = isValidId(findInvite.workspaceId)
+        ? { _id: toId(findInvite.workspaceId) }
+        : { _id: null };
+      const findUser = await workspacesCollection.findOne({
+        ...workspaceFilter,
+        "members.email": userEmail,
+      });
+
+      if (findUser)
+        return res
+          .status(409)
+          .json({ message: "User already exist!", ok: false });
+
+      // invitee's workspace member data
+      const member = {
+        id: new ObjectId().toString(),
+        userId: "",
+        name: userEmail.split("@")[0] || "Member",
+        email: userEmail,
+        role: findInvite.role,
+      };
+
+      // add invitee to the workspace db
+      const addMember = await workspacesCollection.updateOne(
+        { ...workspaceFilter, "members.email": { $ne: userEmail } },
+        { $push: { members: member } },
+      );
+
+      // if failed to add
+      if (!addMember.modifiedCount) {
+        return res.status(409).json({
+          message: "Could not add user to workspace",
+          ok: false,
+        });
+      }
+      // update invite collection db
+      const query = await inviteCollection.findOneAndUpdate(
+        { token: hashedToken, status: "pending" },
+        { $set: { status: "accepted" } },
+        { returnDocument: "after" },
+      );
+
+      // frontend response
+      return res.json({
+        message: "Invite Accepted",
+        ok: true,
+        query,
+      });
+    });
+
+    // delete a sent invite
+    app.delete(
+      "/workspaces/:workspaceId/invites/:inviteId",
+      async (req, res) => {
+        try {
+          const { workspaceId, inviteId } = req.params;
+          const requesterEmail = normalizeEmail(req.body?.email);
+
+          if (!requesterEmail) {
+            return res
+              .status(400)
+              .json({ ok: false, message: "Email is required" });
+          }
+
+          if (!isValidId(workspaceId) || !isValidId(inviteId)) {
+            return res
+              .status(400)
+              .json({ ok: false, message: "Invalid id provided" });
+          }
+
+          const workspace = await workspacesCollection.findOne({
+            _id: toId(workspaceId),
+          });
+          if (!workspace) {
+            return res
+              .status(404)
+              .json({ ok: false, message: "Workspace not found" });
+          }
+
+          const adminMember = (workspace.members || []).find((m) => {
+            const byEmail = normalizeEmail(m.email) === requesterEmail;
+            const role = String(m.role || "").toLowerCase();
+            return byEmail && role === "admin";
+          });
+          if (!adminMember) {
+            return res.status(403).json({
+              ok: false,
+              message: "Only admin can delete invites",
+            });
+          }
+
+          const result = await inviteCollection.deleteOne({
+            _id: toId(inviteId),
+            workspaceId,
+          });
+          if (!result.deletedCount) {
+            return res
+              .status(404)
+              .json({ ok: false, message: "Invite not found" });
+          }
+
+          return res.json({
+            ok: true,
+            message: "Invite deleted",
+          });
+        } catch (error) {
+          console.error(error);
+          return res.status(500).json({ ok: false, message: "Server error" });
+        }
+      },
+    );
+
+    // Invite Feature--------->Rifat_END
 
     // Send a ping to confirm a successful connection
     // await client.db("admin").command({ ping: 1 });
