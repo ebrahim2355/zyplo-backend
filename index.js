@@ -1373,7 +1373,7 @@ async function run() {
     // accept invitation and update workspace member
     app.post("/invites/:choice", async (req, res) => {
       const { choice } = req.params;
-      const { token, email } = req.body;
+      const { token, email, id } = req.body;
 
       // check if token is sent
       if (!token)
@@ -1477,7 +1477,7 @@ async function run() {
       // invitee's workspace member data
       const member = {
         id: new ObjectId().toString(),
-        userId: "",
+        userId: id,
         name: userEmail.split("@")[0] || "Member",
         email: userEmail,
         role: findInvite.role,
