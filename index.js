@@ -668,6 +668,61 @@ async function run() {
       });
     });
 
+    // DELETE /dashboard/projects/:projectId
+    app.delete("/dashboard/projects/:projectId", verifyToken, async (req, res) => {
+      const { projectId } = req.params;
+      const me = getUserIdentity(req);
+
+      if (!isValidId(projectId))
+        return res.status(400).json({ error: "Invalid projectId" });
+
+      const project = await projectsCollection.findOne({ _id: toId(projectId) });
+      if (!project) return res.status(404).json({ error: "Project not found" });
+
+      const workspace = await workspacesCollection.findOne({
+        _id: toId(project.workspaceId),
+      });
+      if (!workspace)
+        return res.status(404).json({ error: "Workspace not found" });
+      if (!isWorkspaceMember(workspace, me))
+        return res.status(403).json({ error: "Forbidden workspace access" });
+
+      await tasksCollection.deleteMany({
+        workspaceId: toId(project.workspaceId),
+        projectId: toId(projectId),
+      });
+      await boardsCollection.deleteMany({
+        workspaceId: toId(project.workspaceId),
+        projectId: toId(projectId),
+      });
+      await projectsCollection.deleteOne({ _id: toId(projectId) });
+
+      return res.json({ ok: true });
+    });
+
+    // DELETE /dashboard/tasks/:taskId
+    app.delete("/dashboard/tasks/:taskId", verifyToken, async (req, res) => {
+      const { taskId } = req.params;
+      const me = getUserIdentity(req);
+
+      if (!isValidId(taskId))
+        return res.status(400).json({ error: "Invalid taskId" });
+
+      const task = await tasksCollection.findOne({ _id: toId(taskId) });
+      if (!task) return res.status(404).json({ error: "Task not found" });
+
+      const workspace = await workspacesCollection.findOne({
+        _id: toId(task.workspaceId),
+      });
+      if (!workspace)
+        return res.status(404).json({ error: "Workspace not found" });
+      if (!isWorkspaceMember(workspace, me))
+        return res.status(403).json({ error: "Forbidden workspace access" });
+
+      await tasksCollection.deleteOne({ _id: toId(taskId) });
+      return res.json({ ok: true });
+    });
+
     // new api for board
     app.get("/dashboard/boards/:projectId", verifyToken, async (req, res) => {
       const { projectId } = req.params;
@@ -1268,7 +1323,7 @@ async function run() {
         // After invite data is stored, send invite email via Resend.
         try {
           await sendResendEmail({
-            to: email,
+            to: "email",
             subject: "You are invited to a workspace",
             html: `
               <div style="margin:0;padding:24px;background:#f3f6fb;font-family:Arial,sans-serif;color:#1f2937;">
@@ -1453,7 +1508,7 @@ async function run() {
         });
       }
 
-      console.log("invitee:" + findInvite.email, "auth:" + userEmail);
+      // console.log("invitee:" + findInvite.email, "auth:" + userEmail);
       // if invitee email and user email doesn't match
       if (normalizeEmail(findInvite.email) !== userEmail)
         return res.status(403).json({
