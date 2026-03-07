@@ -325,6 +325,7 @@ async function run() {
           assigneeId: t.assigneeId || "",
           assigneeName: t.assigneeName || "Unassigned",
           createdAt: t.createdAt,
+          updatedAt: t.updatedAt || "",
         })),
         activity: [],
         notifications: notifications.map((n) => ({
@@ -780,6 +781,7 @@ async function run() {
             assigneeId: t.assigneeId || "",
             assigneeName: t.assigneeName || "Unassigned",
             createdAt: t.createdAt,
+            updatedAt: t.updatedAt || "",
           })),
       }));
 
@@ -953,6 +955,7 @@ async function run() {
               .toArray();
 
             const ops = [];
+            const updatedAt = now();
 
             if (sameColumn) {
               const insertAt = Math.min(
@@ -963,7 +966,7 @@ async function run() {
               reordered.splice(insertAt, 0, task);
 
               reordered.forEach((t, index) => {
-                const $set = { order: index };
+                const $set = { order: index, updatedAt };
                 if (String(t._id) === String(task._id) && explicitStatus) {
                   $set.status = nextStatus;
                 }
@@ -987,7 +990,7 @@ async function run() {
                 ops.push({
                   updateOne: {
                     filter: { _id: toId(t._id) },
-                    update: { $set: { order: index } },
+                    update: { $set: { order: index, updatedAt } },
                   },
                 });
               });
@@ -1012,6 +1015,7 @@ async function run() {
                           columnId: destinationId,
                           order: index,
                           status: nextStatus,
+                          updatedAt,
                         },
                       },
                     },
@@ -1020,7 +1024,7 @@ async function run() {
                   ops.push({
                     updateOne: {
                       filter: { _id: toId(t._id) },
-                      update: { $set: { order: index } },
+                      update: { $set: { order: index, updatedAt } },
                     },
                   });
                 }
@@ -1074,6 +1078,7 @@ async function run() {
                     assigneeId: t.assigneeId || "",
                     assigneeName: t.assigneeName || "Unassigned",
                     createdAt: t.createdAt,
+                    updatedAt: t.updatedAt || "",
                   })),
               })),
             };
@@ -1142,6 +1147,7 @@ async function run() {
           $set.projectId = toId(patch.projectId);
         }
       }
+      $set.updatedAt = now();
 
       const result = await tasksCollection.findOneAndUpdate(
         { _id: toId(taskId) },
@@ -1170,6 +1176,7 @@ async function run() {
           assigneeId: t.assigneeId || "",
           assigneeName: t.assigneeName || "Unassigned",
           createdAt: t.createdAt,
+          updatedAt: t.updatedAt || "",
         },
       });
     });
