@@ -626,6 +626,7 @@ async function run() {
         attachments: Array.isArray(attachments) ? attachments : [],
         // file attach - bayijid
         createdAt: now(),
+        updatedAt: now(),
       };
 
       const result = await tasksCollection.insertOne(task);
@@ -963,9 +964,6 @@ async function run() {
                 const $set = { order: index, updatedAt };
                 if (String(t._id) === String(task._id) && explicitStatus) {
                   $set.status = nextStatus;
-                  //Bayijid
-                  $set.updatedAt = now();
-                  //Bayijid
                 }
                 ops.push({
                   updateOne: {
@@ -1013,9 +1011,6 @@ async function run() {
                           order: index,
                           status: nextStatus,
                           updatedAt,
-                          //Bayijid
-                          // updatedAt: now(),
-                          //Bayijid
                         },
                       },
                     },
@@ -1130,10 +1125,7 @@ async function run() {
         "assigneeId",
         "assigneeName",
         "projectName",
-        // Bayijid
-        "updatedAt",
         "attachments",
-        // Bayijid
       ]) {
         if (typeof patch[k] === "string") $set[k] = patch[k];
       }
@@ -1142,12 +1134,6 @@ async function run() {
       if (Array.isArray(patch.attachments)) {
         $set.attachments = patch.attachments;
       }
-
-      // If frontend didn't send it, force the backend to set it right now:
-      if (!$set.updatedAt) {
-        $set.updatedAt = now();
-      }
-      // Bayijid
 
       if (patch.projectId !== undefined) {
         if (!patch.projectId) {
