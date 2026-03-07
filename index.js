@@ -7,6 +7,7 @@ require("dotenv").config();
 const jwt = require("jsonwebtoken");
 const { z } = require("zod");
 const crypto = require("crypto");
+const nodemailer = require("nodemailer");
 const port = process.env.PORT || 5000;
 
 setServers(["1.1.1.1", "8.8.8.8"]);
@@ -74,32 +75,27 @@ async function run() {
       String(value || "")
         .trim()
         .toLowerCase();
-    // Basic Resend sender using .env keys.
-    const sendResendEmail = async ({ to, subject, html }) => {
-      if (!process.env.RESEND_API_KEY || !process.env.RESEND_FROM_EMAIL) {
-        throw new Error("Missing RESEND_API_KEY or RESEND_FROM_EMAIL");
+
+    // Basic Gmail SMTP sender using .env credentials.
+    const transporter = nodemailer.createTransport({
+      service: "gmail",
+      auth: {
+        user: process.env.USER_EMAIL,
+        pass: process.env.USER_PASS,
+      },
+    });
+
+    const sendInviteEmail = async ({ to, subject, html }) => {
+      if (!process.env.USER_EMAIL || !process.env.USER_PASS) {
+        throw new Error("Missing USER_EMAIL or USER_PASS");
       }
 
-      const response = await fetch("https://api.resend.com/emails", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          from: process.env.RESEND_FROM_EMAIL,
-          to,
-          subject,
-          html,
-        }),
+      return transporter.sendMail({
+        from: process.env.USER_EMAIL,
+        to,
+        subject,
+        html,
       });
-
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data?.message || "Email send failed");
-      }
-
-      return data;
     };
 
     const getUserIdentity = (req) => ({
@@ -1256,6 +1252,7 @@ async function run() {
           email,
           role,
           workspaceId,
+          workspaceName: workspace.name,
           status: "pending",
           token: hashedToken,
           createdAt: new Date(),
@@ -1265,37 +1262,92 @@ async function run() {
         // send invite data to db
         const result = await inviteCollection.insertOne(inviteData);
 
-        // After invite data is stored, send invite email via Resend.
+        // After invite data is stored, send invite email via Gmail SMTP.
         try {
-          await sendResendEmail({
+          await sendInviteEmail({
             to: email,
-            subject: "You are invited to a workspace",
+            subject: `You're invited to join ${workspace.name}`,
             html: `
-              <div style="margin:0;padding:24px;background:#f3f6fb;font-family:Arial,sans-serif;color:#1f2937;">
-                <div style="max-width:560px;margin:0 auto;background:#ffffff;border:1px solid #e5e7eb;border-radius:12px;padding:24px;">
-                  <h2 style="margin:0 0 12px;font-size:20px;line-height:1.3;color:#111827;">You're invited to join a workspace</h2>
-                  <p style="margin:0 0 10px;font-size:14px;line-height:1.6;color:#374151;">
-                    You have been invited as <strong style="text-transform:capitalize;">${role}</strong>.
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <style>
+        /* Responsive styles for mobile clients */
+        @media only screen and (max-width: 600px) {
+          .container { width: 100% !important; border-radius: 0 !important; border: none !important; }
+          .content { padding: 30px 20px !important; }
+          .button { width: 100% !important; text-align: center; display: block !important; box-sizing: border-box; }
+        }
+      </style>
+    </head>
+    <body style="margin:0;padding:0;background-color:#f4f7fa;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+      <table width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color:#f4f7fa;padding:40px 0;">
+        <tr>
+          <td align="center">
+            <table class="container" width="560" border="0" cellspacing="0" cellpadding="0" style="background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 10px 15px -3px rgba(0,0,0,0.1);border:1px solid #e5e7eb;">
+              
+              <tr>
+                <td class="content" style="padding:40px 40px 0 40px;">
+                  <img src="https://res.cloudinary.com/dsyahfiyo/image/upload/v1772881604/logo1_b7iv2u.png" 
+                       alt="${workspace.name}" 
+                       width="48" 
+                       style="display:block; border:0; outline:none; text-decoration:none; max-width:120px; height:auto;">
+                </td>
+              </tr>
+
+              <tr>
+                <td class="content" style="padding:32px 40px 40px 40px;">
+                  <h1 style="margin:0 0 16px;font-size:24px;font-weight:700;color:#111827;line-height:1.2;">
+                    Join the workspace
+                  </h1>
+                  <p style="margin:0 0 20px;font-size:16px;line-height:1.6;color:#4b5563;">
+                    Hi there! You've been invited to join <strong>${workspace.name}</strong> as a 
+                    <span style="background:#f3f4f6;color:#111827;padding:2px 8px;border-radius:4px;font-weight:600;font-size:14px;text-transform:capitalize;">${role}</span>.
                   </p>
-                  <p style="margin:0 0 18px;font-size:14px;line-height:1.6;color:#374151;">
-                    Click below to accept your invitation.
+                  <p style="margin:0 0 32px;font-size:16px;line-height:1.6;color:#4b5563;">
+                    Collaborate with your team, manage projects, and stay updated—all in one place.
                   </p>
-                  <a href="${inviteLink}" style="display:inline-block;background:#4f46e5;color:#ffffff;text-decoration:none;font-size:14px;font-weight:600;padding:10px 16px;border-radius:8px;">
+                  
+                  <a href="${inviteLink}" class="button" style="display:inline-block;background-color:#4f46e5;color:#ffffff;text-decoration:none;font-size:16px;font-weight:600;padding:14px 30px;border-radius:8px;">
                     Accept Invitation
                   </a>
-                  <p style="margin:18px 0 6px;font-size:12px;line-height:1.5;color:#6b7280;">
-                    If the button does not work, use this link:
+                </td>
+              </tr>
+
+              <tr>
+                <td style="padding:30px 40px;background-color:#f9fafb;border-top:1px solid #e5e7eb;">
+                  <p style="margin:0 0 10px;font-size:12px;color:#9ca3af;text-transform:uppercase;letter-spacing:1px;font-weight:700;">
+                    Trouble with the button?
                   </p>
-                  <p style="margin:0;font-size:12px;line-height:1.5;word-break:break-all;">
-                    <a href="${inviteLink}" style="color:#4f46e5;text-decoration:underline;">${inviteLink}</a>
+                  <p style="margin:0;font-size:13px;line-height:1.5;word-break:break-all;">
+                    <a href="${inviteLink}" style="color:#4f46e5;text-decoration:none;">${inviteLink}</a>
                   </p>
-                </div>
-              </div>
-            `,
+                </td>
+              </tr>
+            </table>
+
+            <table width="560" class="container" border="0" cellspacing="0" cellpadding="0">
+              <tr>
+                <td style="padding:24px 10px;text-align:center;">
+                  <p style="margin:0;font-size:12px;color:#9ca3af;line-height:1.4;">
+                    This invitation was sent to you by ${workspace.name}.<br>
+                    If you weren't expecting this, you can safely ignore this email.
+                  </p>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </body>
+    </html>
+  `,
           });
         } catch (mailError) {
           // Keep invite creation successful even if email sending fails.
-          console.error("Resend send failed:", mailError?.message || mailError);
+          console.error("SMTP send failed:", mailError?.message || mailError);
         }
 
         // send response to frontend
@@ -1303,6 +1355,7 @@ async function run() {
           ok: true,
           inviteLink,
           message: "Invite created!",
+          workspaceName: workspace.name,
           status: inviteData.status,
           expiresAt: inviteData.expiresAt,
         });
@@ -1357,6 +1410,7 @@ async function run() {
           ok: true,
           invite: {
             inviteeEmail: findInvite.email,
+            workspaceName: findInvite.workspaceName || "",
             role: findInvite.role,
             status: findInvite.status,
             expiresAt: findInvite.expiresAt,
@@ -1432,6 +1486,12 @@ async function run() {
 
       //  Now if the user accept the invitation...
       const userEmail = normalizeEmail(email);
+      if (!id) {
+        return res.status(400).json({
+          message: "User id is required",
+          ok: false,
+        });
+      }
 
       // find the invitation
       const findInvite = await inviteCollection.findOne({
