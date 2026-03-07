@@ -7,7 +7,6 @@ require("dotenv").config();
 const jwt = require("jsonwebtoken");
 const { z } = require("zod");
 const crypto = require("crypto");
-const nodemailer = require("nodemailer");
 const port = process.env.PORT || 5000;
 
 setServers(["1.1.1.1", "8.8.8.8"]);
@@ -52,7 +51,7 @@ const inviteSchema = z.object({
 
 async function run() {
   try {
-    // Connect the client to the server	(optional starting in v4.7)
+    // Connect the client to the server (optional starting in v4.7)
     // await client.connect();
 
     const db = client.db("zyplo-db");
@@ -76,28 +75,6 @@ async function run() {
         .trim()
         .toLowerCase();
 
-    // Basic Gmail SMTP sender using .env credentials.
-    const transporter = nodemailer.createTransport({
-      service: "gmail",
-      auth: {
-        user: process.env.USER_EMAIL,
-        pass: process.env.USER_PASS,
-      },
-    });
-
-    const sendInviteEmail = async ({ to, subject, html }) => {
-      if (!process.env.USER_EMAIL || !process.env.USER_PASS) {
-        throw new Error("Missing USER_EMAIL or USER_PASS");
-      }
-
-      return transporter.sendMail({
-        from: process.env.USER_EMAIL,
-        to,
-        subject,
-        html,
-      });
-    };
-
     const getUserIdentity = (req) => ({
       id: req.user?.id || req.headers["x-user-id"],
       email: req.user?.email || req.headers["x-user-email"] || "",
@@ -105,11 +82,10 @@ async function run() {
     });
 
     const isWorkspaceMember = (workspace, me) => {
-      const myId = String(me?.id || "");
       const myEmail = normalizeEmail(me?.email);
       return (workspace?.members || []).some(
         (m) =>
-          (myId && String(m.userId || "") === myId) ||
+          String(m.userId || "") === String(me?.id || "") ||
           (myEmail && normalizeEmail(m.email) === myEmail),
       );
     };
@@ -321,6 +297,9 @@ async function run() {
           assigneeId: t.assigneeId || "",
           assigneeName: t.assigneeName || "Unassigned",
           createdAt: t.createdAt,
+          // bayijid - file attach
+          attachments: t.attachments || [],
+          // bayijid - file attach
         })),
         activity: [],
         notifications: notifications.map((n) => ({
@@ -556,6 +535,9 @@ async function run() {
         status = "todo",
         dueDate = "",
         assigneeId = "",
+        // bayijid - file attach
+        attachments = [],
+        // bayijid - file attach
       } = req.body || {};
       if (!workspaceId || !projectId || !boardId || !columnId || !title?.trim())
         return res.status(400).json({
@@ -639,6 +621,9 @@ async function run() {
         dueDate,
         assigneeId: assignee?.id || "",
         assigneeName: assignee?.name || "Unassigned",
+        // file attach - bayijid
+        attachments: Array.isArray(attachments) ? attachments : [],
+        // file attach - bayijid
         createdAt: now(),
       };
 
@@ -660,6 +645,9 @@ async function run() {
           assigneeId: task.assigneeId,
           assigneeName: task.assigneeName,
           createdAt: task.createdAt,
+          // file attach - helal / bayijid
+          attachments: task.attachments || [],
+          // file attach - helal / bayijid
         },
       });
     });
@@ -721,6 +709,9 @@ async function run() {
             assigneeId: t.assigneeId || "",
             assigneeName: t.assigneeName || "Unassigned",
             createdAt: t.createdAt,
+            // file attach - helal / bayijid
+            attachments: t.attachments || [],
+            // file attach - helal / bayijid
           })),
       }));
 
@@ -907,6 +898,9 @@ async function run() {
                 const $set = { order: index };
                 if (String(t._id) === String(task._id) && explicitStatus) {
                   $set.status = nextStatus;
+                  //Bayijid
+                  $set.updatedAt = now();
+                  //Bayijid
                 }
                 ops.push({
                   updateOne: {
@@ -953,6 +947,9 @@ async function run() {
                           columnId: destinationId,
                           order: index,
                           status: nextStatus,
+                          //Bayijid
+                          updatedAt: now(),
+                          //Bayijid
                         },
                       },
                     },
@@ -1015,6 +1012,9 @@ async function run() {
                     assigneeId: t.assigneeId || "",
                     assigneeName: t.assigneeName || "Unassigned",
                     createdAt: t.createdAt,
+                    // file attach - helal / bayijid
+                    attachments: t.attachments || [],
+                    // file attach - helal / bayijid
                   })),
               })),
             };
@@ -1063,9 +1063,25 @@ async function run() {
         "assigneeId",
         "assigneeName",
         "projectName",
+        // Bayijid
+        "updatedAt",
+        "attachments"
+        // Bayijid
       ]) {
         if (typeof patch[k] === "string") $set[k] = patch[k];
       }
+
+      // Bayijid - file attach
+      if (Array.isArray(patch.attachments)) {
+        $set.attachments = patch.attachments;
+      }
+      
+      // If frontend didn't send it, force the backend to set it right now:
+      if (!$set.updatedAt) {
+        $set.updatedAt = now();
+      }
+      // Bayijid
+
       if (patch.projectId !== undefined) {
         if (!patch.projectId) {
           $set.projectId = null;
@@ -1090,10 +1106,12 @@ async function run() {
         { returnDocument: "after" },
       );
 
-      if (!result.value)
+      // FIX MONGODB V6 RETURN DOCUMENT ISSUE
+      const t = result?.value || result;
+
+      if (!t || !t._id)
         return res.status(404).json({ error: "Task not found" });
 
-      const t = result.value;
       res.json({
         task: {
           id: String(t._id),
@@ -1111,6 +1129,9 @@ async function run() {
           assigneeId: t.assigneeId || "",
           assigneeName: t.assigneeName || "Unassigned",
           createdAt: t.createdAt,
+          // file attach - helal / bayijid
+          attachments: t.attachments || [],
+          // file attach - helal / bayijid
         },
       });
     });
@@ -1252,7 +1273,6 @@ async function run() {
           email,
           role,
           workspaceId,
-          workspaceName: workspace.name,
           status: "pending",
           token: hashedToken,
           createdAt: new Date(),
@@ -1262,100 +1282,11 @@ async function run() {
         // send invite data to db
         const result = await inviteCollection.insertOne(inviteData);
 
-        // After invite data is stored, send invite email via Gmail SMTP.
-        try {
-          await sendInviteEmail({
-            to: email,
-            subject: `You're invited to join ${workspace.name}`,
-            html: `
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <meta charset="utf-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <style>
-        /* Responsive styles for mobile clients */
-        @media only screen and (max-width: 600px) {
-          .container { width: 100% !important; border-radius: 0 !important; border: none !important; }
-          .content { padding: 30px 20px !important; }
-          .button { width: 100% !important; text-align: center; display: block !important; box-sizing: border-box; }
-        }
-      </style>
-    </head>
-    <body style="margin:0;padding:0;background-color:#f4f7fa;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
-      <table width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color:#f4f7fa;padding:40px 0;">
-        <tr>
-          <td align="center">
-            <table class="container" width="560" border="0" cellspacing="0" cellpadding="0" style="background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 10px 15px -3px rgba(0,0,0,0.1);border:1px solid #e5e7eb;">
-              
-              <tr>
-                <td class="content" style="padding:40px 40px 0 40px;">
-                  <img src="https://res.cloudinary.com/dsyahfiyo/image/upload/v1772881604/logo1_b7iv2u.png" 
-                       alt="${workspace.name}" 
-                       width="48" 
-                       style="display:block; border:0; outline:none; text-decoration:none; max-width:120px; height:auto;">
-                </td>
-              </tr>
-
-              <tr>
-                <td class="content" style="padding:32px 40px 40px 40px;">
-                  <h1 style="margin:0 0 16px;font-size:24px;font-weight:700;color:#111827;line-height:1.2;">
-                    Join the workspace
-                  </h1>
-                  <p style="margin:0 0 20px;font-size:16px;line-height:1.6;color:#4b5563;">
-                    Hi there! You've been invited to join <strong>${workspace.name}</strong> as a 
-                    <span style="background:#f3f4f6;color:#111827;padding:2px 8px;border-radius:4px;font-weight:600;font-size:14px;text-transform:capitalize;">${role}</span>.
-                  </p>
-                  <p style="margin:0 0 32px;font-size:16px;line-height:1.6;color:#4b5563;">
-                    Collaborate with your team, manage projects, and stay updated—all in one place.
-                  </p>
-                  
-                  <a href="${inviteLink}" class="button" style="display:inline-block;background-color:#4f46e5;color:#ffffff;text-decoration:none;font-size:16px;font-weight:600;padding:14px 30px;border-radius:8px;">
-                    Accept Invitation
-                  </a>
-                </td>
-              </tr>
-
-              <tr>
-                <td style="padding:30px 40px;background-color:#f9fafb;border-top:1px solid #e5e7eb;">
-                  <p style="margin:0 0 10px;font-size:12px;color:#9ca3af;text-transform:uppercase;letter-spacing:1px;font-weight:700;">
-                    Trouble with the button?
-                  </p>
-                  <p style="margin:0;font-size:13px;line-height:1.5;word-break:break-all;">
-                    <a href="${inviteLink}" style="color:#4f46e5;text-decoration:none;">${inviteLink}</a>
-                  </p>
-                </td>
-              </tr>
-            </table>
-
-            <table width="560" class="container" border="0" cellspacing="0" cellpadding="0">
-              <tr>
-                <td style="padding:24px 10px;text-align:center;">
-                  <p style="margin:0;font-size:12px;color:#9ca3af;line-height:1.4;">
-                    This invitation was sent to you by ${workspace.name}.<br>
-                    If you weren't expecting this, you can safely ignore this email.
-                  </p>
-                </td>
-              </tr>
-            </table>
-          </td>
-        </tr>
-      </table>
-    </body>
-    </html>
-  `,
-          });
-        } catch (mailError) {
-          // Keep invite creation successful even if email sending fails.
-          console.error("SMTP send failed:", mailError?.message || mailError);
-        }
-
         // send response to frontend
         return res.status(201).json({
           ok: true,
           inviteLink,
           message: "Invite created!",
-          workspaceName: workspace.name,
           status: inviteData.status,
           expiresAt: inviteData.expiresAt,
         });
@@ -1410,7 +1341,6 @@ async function run() {
           ok: true,
           invite: {
             inviteeEmail: findInvite.email,
-            workspaceName: findInvite.workspaceName || "",
             role: findInvite.role,
             status: findInvite.status,
             expiresAt: findInvite.expiresAt,
@@ -1427,7 +1357,7 @@ async function run() {
     // accept invitation and update workspace member
     app.post("/invites/:choice", async (req, res) => {
       const { choice } = req.params;
-      const { token, email, id } = req.body;
+      const { token, email } = req.body;
 
       // check if token is sent
       if (!token)
@@ -1471,7 +1401,8 @@ async function run() {
         );
 
         // if revoking fails for some reason
-        if (!findInvitee.value) {
+        const inviteDoc = findInvitee?.value || findInvitee;
+        if (!inviteDoc || !inviteDoc._id) {
           return res.status(404).json({
             ok: false,
             message: "Invite not found or already processed",
@@ -1486,12 +1417,6 @@ async function run() {
 
       //  Now if the user accept the invitation...
       const userEmail = normalizeEmail(email);
-      if (!id) {
-        return res.status(400).json({
-          message: "User id is required",
-          ok: false,
-        });
-      }
 
       // find the invitation
       const findInvite = await inviteCollection.findOne({
@@ -1537,7 +1462,7 @@ async function run() {
       // invitee's workspace member data
       const member = {
         id: new ObjectId().toString(),
-        userId: id,
+        userId: "",
         name: userEmail.split("@")[0] || "Member",
         email: userEmail,
         role: findInvite.role,
