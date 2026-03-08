@@ -7,6 +7,7 @@ require("dotenv").config();
 const jwt = require("jsonwebtoken");
 const { z } = require("zod");
 const crypto = require("crypto");
+const nodemailer = require("nodemailer");
 const port = process.env.PORT || 5000;
 
 setServers(["1.1.1.1", "8.8.8.8"]);
@@ -74,6 +75,27 @@ async function run() {
       String(value || "")
         .trim()
         .toLowerCase();
+    // Basic Gmail SMTP sender using .env credentials.
+    const transporter = nodemailer.createTransport({
+      service: "gmail",
+      auth: {
+        user: process.env.USER_EMAIL,
+        pass: process.env.USER_PASS,
+      },
+    });
+
+    const sendInviteEmail = async ({ to, subject, html }) => {
+      if (!process.env.USER_EMAIL || !process.env.USER_PASS) {
+        throw new Error("Missing USER_EMAIL or USER_PASS");
+      }
+
+      return transporter.sendMail({
+        from: process.env.USER_EMAIL,
+        to,
+        subject,
+        html,
+      });
+    };
 
     const getUserIdentity = (req) => ({
       id: req.user?.id || req.headers["x-user-id"],
@@ -1218,165 +1240,267 @@ async function run() {
     // Invite Feature--------->Rifat_START
 
     // get all invites for a workspace.
-    app.get("/workspaces/:workspaceId/invites", verifyToken, async (req, res) => {
-      try {
-        const { workspaceId } = req.params;
-        const me = getUserIdentity(req);
+    app.get(
+      "/workspaces/:workspaceId/invites",
+      verifyToken,
+      async (req, res) => {
+        try {
+          const { workspaceId } = req.params;
+          const me = getUserIdentity(req);
 
-        // isValidId--> checks valid workspaceId
-        if (!isValidId(workspaceId)) {
-          return res
-            .status(400)
-            .json({ ok: false, message: "Invalid workspace id" });
+          // isValidId--> checks valid workspaceId
+          if (!isValidId(workspaceId)) {
+            return res
+              .status(400)
+              .json({ ok: false, message: "Invalid workspace id" });
+          }
+
+          // find the workspace
+          // toId--> converts to ObjectId
+          const workspace = await workspacesCollection.findOne({
+            _id: toId(workspaceId),
+          });
+          if (!workspace) {
+            return res
+              .status(404)
+              .json({ ok: false, message: "Workspace not found" });
+          }
+          if (!isWorkspaceMember(workspace, me)) {
+            return res.status(403).json({ ok: false, message: "Forbidden" });
+          }
+
+          // finds all invites under a workspace
+          const invites = await inviteCollection
+            .find({ workspaceId })
+            .sort({ createdAt: -1 })
+            .toArray();
+
+          // UI-friendly response: include workspace.members with id/name/email/role.
+          return res.json({
+            ok: true,
+            workspace: {
+              id: String(workspace._id),
+              name: workspace.name,
+              // workspace members are in a arr
+              members: (workspace.members || []).map((member) => ({
+                id: member.id || member.userId || new ObjectId().toString(),
+                name:
+                  member.name ||
+                  (member.email ? member.email.split("@")[0] : "Member"),
+                email: member.email || "",
+                role: member.role || "Member",
+              })),
+            },
+            invites,
+          });
+        } catch (error) {
+          console.error(error);
+          return res.status(500).json({ ok: false, message: "Server error" });
         }
-
-        // find the workspace
-        // toId--> converts to ObjectId
-        const workspace = await workspacesCollection.findOne({
-          _id: toId(workspaceId),
-        });
-        if (!workspace) {
-          return res
-            .status(404)
-            .json({ ok: false, message: "Workspace not found" });
-        }
-        if (!isWorkspaceMember(workspace, me)) {
-          return res.status(403).json({ ok: false, message: "Forbidden" });
-        }
-
-        // finds all invites under a workspace
-        const invites = await inviteCollection
-          .find({ workspaceId })
-          .sort({ createdAt: -1 })
-          .toArray();
-
-        // UI-friendly response: include workspace.members with id/name/email/role.
-        return res.json({
-          ok: true,
-          workspace: {
-            id: String(workspace._id),
-            name: workspace.name,
-            // workspace members are in a arr
-            members: (workspace.members || []).map((member) => ({
-              id: member.id || member.userId || new ObjectId().toString(),
-              name:
-                member.name ||
-                (member.email ? member.email.split("@")[0] : "Member"),
-              email: member.email || "",
-              role: member.role || "Member",
-            })),
-          },
-          invites,
-        });
-      } catch (error) {
-        console.error(error);
-        return res.status(500).json({ ok: false, message: "Server error" });
-      }
-    });
+      },
+    );
 
     // post invites
-    app.post("/workspaces/:workspaceId/invites", verifyToken, async (req, res) => {
-      try {
-        const clientSideData = inviteSchema.parse(req.body);
-        const role = clientSideData.role;
-        const email = normalizeEmail(clientSideData.email);
-        const { workspaceId } = req.params;
-        const me = getUserIdentity(req);
+    app.post(
+      "/workspaces/:workspaceId/invites",
+      verifyToken,
+      async (req, res) => {
+        try {
+          const clientSideData = inviteSchema.parse(req.body);
+          const role = clientSideData.role;
+          const email = normalizeEmail(clientSideData.email);
+          const { workspaceId } = req.params;
+          const me = getUserIdentity(req);
 
-        // Checks valid workspace
-        if (!isValidId(workspaceId)) {
-          return res
-            .status(400)
-            .json({ ok: false, message: "Invalid workspace id" });
-        }
-        // find the workspace
-        const workspace = await workspacesCollection.findOne({
-          _id: toId(workspaceId),
-        });
-
-        if (!workspace) {
-          return res
-            .status(404)
-            .json({ ok: false, message: "Workspace not found" });
-        }
-        if (!isWorkspaceAdmin(workspace, me)) {
-          return res.status(403).json({ ok: false, message: "Forbidden" });
-        }
-        // generate random token for URL and hashed version for DB
-        const rawToken = crypto.randomBytes(32).toString("hex");
-        const hashedToken = crypto
-          .createHash("sha256")
-          .update(rawToken)
-          .digest("hex");
-
-        // Create a Link to send via Email/Console
-        const frontendURL = process.env.FRONTEND_URL || "http://localhost:3000";
-        const inviteLink = `${frontendURL}/accept-invite/${rawToken}`;
-
-        // find if the user is already a member
-        const existingMember = isWorkspaceMember(workspace, { id: "", email });
-
-        // do this if found in existing workspace
-        if (existingMember) {
-          return res.status(409).json({
-            ok: false,
-            message: "User is already in workspace",
+          // Checks valid workspace
+          if (!isValidId(workspaceId)) {
+            return res
+              .status(400)
+              .json({ ok: false, message: "Invalid workspace id" });
+          }
+          // find the workspace
+          const workspace = await workspacesCollection.findOne({
+            _id: toId(workspaceId),
           });
-        }
 
-        // find if the user is already invited
-        const existingInvite = await inviteCollection.findOne({
-          email,
-          workspaceId,
-          status: "pending",
-          expiresAt: { $gt: new Date() },
-        });
+          if (!workspace) {
+            return res
+              .status(404)
+              .json({ ok: false, message: "Workspace not found" });
+          }
+          if (!isWorkspaceAdmin(workspace, me)) {
+            return res.status(403).json({ ok: false, message: "Forbidden" });
+          }
+          // generate random token for URL and hashed version for DB
+          const rawToken = crypto.randomBytes(32).toString("hex");
+          const hashedToken = crypto
+            .createHash("sha256")
+            .update(rawToken)
+            .digest("hex");
 
-        // do this if found in existing db
-        if (existingInvite) {
-          return res.status(409).json({
-            ok: false,
-            message: "Invite already sent",
-            expiresAt: existingInvite.expiresAt,
+          // Create a Link to send via Email/Console
+          const frontendURL =
+            process.env.FRONTEND_URL || "http://localhost:3000";
+          const inviteLink = `${frontendURL}/accept-invite/${rawToken}`;
+
+          // find if the user is already a member
+          const existingMember = isWorkspaceMember(workspace, {
+            id: "",
+            email,
           });
-        }
 
-        //  invite data for db
-        const inviteData = {
-          email,
-          role,
-          workspaceId,
-          status: "pending",
-          token: hashedToken,
-          createdAt: new Date(),
-          expiresAt: new Date(Date.now() + 2 * 24 * 60 * 60 * 1000),
-        };
+          // do this if found in existing workspace
+          if (existingMember) {
+            return res.status(409).json({
+              ok: false,
+              message: "User is already in workspace",
+            });
+          }
 
-        // send invite data to db
-        const result = await inviteCollection.insertOne(inviteData);
-
-        // send response to frontend
-        return res.status(201).json({
-          ok: true,
-          inviteLink,
-          message: "Invite created!",
-          status: inviteData.status,
-          expiresAt: inviteData.expiresAt,
-        });
-      } catch (error) {
-        // catch zod error
-        if (error instanceof z.ZodError) {
-          return res.status(400).json({
-            ok: false,
-            message: "Validation failed",
-            errors: error,
+          // find if the user is already invited
+          const existingInvite = await inviteCollection.findOne({
+            email,
+            workspaceId,
+            status: "pending",
+            expiresAt: { $gt: new Date() },
           });
+
+          // do this if found in existing db
+          if (existingInvite) {
+            return res.status(409).json({
+              ok: false,
+              message: "Invite already sent",
+              expiresAt: existingInvite.expiresAt,
+            });
+          }
+
+          //  invite data for db
+          const inviteData = {
+            email,
+            role,
+            workspaceId,
+            workspaceName: workspace.name,
+            status: "pending",
+            token: hashedToken,
+            createdAt: new Date(),
+            expiresAt: new Date(Date.now() + 2 * 24 * 60 * 60 * 1000),
+          };
+
+          // send invite data to db
+          const result = await inviteCollection.insertOne(inviteData);
+
+          // After invite data is stored, send invite email via Gmail SMTP.
+          try {
+            await sendInviteEmail({
+              to: email,
+              subject: `You're invited to join ${workspace.name}`,
+              html: `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <style>
+        /* Responsive styles for mobile clients */
+        @media only screen and (max-width: 600px) {
+          .container { width: 100% !important; border-radius: 0 !important; border: none !important; }
+          .content { padding: 30px 20px !important; }
+          .button { width: 100% !important; text-align: center; display: block !important; box-sizing: border-box; }
         }
-        // catch and send other error
-        console.error(error);
-        return res.status(500).json({ ok: false, message: "Server error" });
-      }
-    });
+      </style>
+    </head>
+    <body style="margin:0;padding:0;background-color:#f4f7fa;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+      <table width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color:#f4f7fa;padding:40px 0;">
+        <tr>
+          <td align="center">
+            <table class="container" width="560" border="0" cellspacing="0" cellpadding="0" style="background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 10px 15px -3px rgba(0,0,0,0.1);border:1px solid #e5e7eb;">
+              
+              <tr>
+                <td class="content" style="padding:40px 40px 0 40px;">
+                  <img src="https://res.cloudinary.com/dsyahfiyo/image/upload/v1772881604/logo1_b7iv2u.png" 
+                       alt="${workspace.name}" 
+                       width="48" 
+                       style="display:block; border:0; outline:none; text-decoration:none; max-width:120px; height:auto;">
+                </td>
+              </tr>
+
+              <tr>
+                <td class="content" style="padding:32px 40px 40px 40px;">
+                  <h1 style="margin:0 0 16px;font-size:24px;font-weight:700;color:#111827;line-height:1.2;">
+                    Join the workspace
+                  </h1>
+                  <p style="margin:0 0 20px;font-size:16px;line-height:1.6;color:#4b5563;">
+                    Hi there! You've been invited to join <strong>${workspace.name}</strong> as a 
+                    <span style="background:#f3f4f6;color:#111827;padding:2px 8px;border-radius:4px;font-weight:600;font-size:14px;text-transform:capitalize;">${role}</span>.
+                  </p>
+                  <p style="margin:0 0 32px;font-size:16px;line-height:1.6;color:#4b5563;">
+                    Collaborate with your team, manage projects, and stay updated—all in one place.
+                  </p>
+                  
+                  <a href="${inviteLink}" class="button" style="display:inline-block;background-color:#4f46e5;color:#ffffff;text-decoration:none;font-size:16px;font-weight:600;padding:14px 30px;border-radius:8px;">
+                    Accept Invitation
+                  </a>
+                </td>
+              </tr>
+
+              <tr>
+                <td style="padding:30px 40px;background-color:#f9fafb;border-top:1px solid #e5e7eb;">
+                  <p style="margin:0 0 10px;font-size:12px;color:#9ca3af;text-transform:uppercase;letter-spacing:1px;font-weight:700;">
+                    Trouble with the button?
+                  </p>
+                  <p style="margin:0;font-size:13px;line-height:1.5;word-break:break-all;">
+                    <a href="${inviteLink}" style="color:#4f46e5;text-decoration:none;">${inviteLink}</a>
+                  </p>
+                </td>
+              </tr>
+            </table>
+
+            <table width="560" class="container" border="0" cellspacing="0" cellpadding="0">
+              <tr>
+                <td style="padding:24px 10px;text-align:center;">
+                  <p style="margin:0;font-size:12px;color:#9ca3af;line-height:1.4;">
+                    This invitation was sent to you by ${workspace.name}.<br>
+                    If you weren't expecting this, you can safely ignore this email.
+                  </p>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </body>
+    </html>
+  `,
+            });
+          } catch (mailError) {
+            // Keep invite creation successful even if email sending fails.
+            console.error("SMTP send failed:", mailError?.message || mailError);
+          }
+
+          // send response to frontend
+          return res.status(201).json({
+            ok: true,
+            inviteLink,
+            message: "Invite created!",
+            workspaceName: workspace.name,
+            status: inviteData.status,
+            expiresAt: inviteData.expiresAt,
+          });
+        } catch (error) {
+          // catch zod error
+          if (error instanceof z.ZodError) {
+            return res.status(400).json({
+              ok: false,
+              message: "Validation failed",
+              errors: error,
+            });
+          }
+          // catch and send other error
+          console.error(error);
+          return res.status(500).json({ ok: false, message: "Server error" });
+        }
+      },
+    );
 
     // check valid invitation
     app.get("/invites/:token", async (req, res) => {
@@ -1414,6 +1538,7 @@ async function run() {
           ok: true,
           invite: {
             inviteeEmail: findInvite.email,
+            workspaceName: findInvite.workspaceName || "",
             role: findInvite.role,
             status: findInvite.status,
             expiresAt: findInvite.expiresAt,
@@ -1475,8 +1600,7 @@ async function run() {
         );
 
         // if revoking fails for some reason
-        const inviteDoc = findInvitee?.value || findInvitee;
-        if (!inviteDoc || !inviteDoc._id) {
+        if (!findInvitee.value) {
           return res.status(404).json({
             ok: false,
             message: "Invite not found or already processed",
@@ -1518,7 +1642,7 @@ async function run() {
         });
       }
 
-      // console.log("invitee:" + findInvite.email, "auth:" + userEmail);
+      console.log("invitee:" + findInvite.email, "auth:" + userEmail);
       // if invitee email and user email doesn't match
       if (normalizeEmail(findInvite.email) !== userEmail)
         return res.status(403).json({
