@@ -557,16 +557,20 @@ async function run() {
       verifyToken,
       async (req, res) => {
         const { workspaceId } = req.params;
-        const { email, role = "Member" } = req.body || {};
+        const { email, role = "member" } = req.body || {};
         const clean = normalizeEmail(email);
         if (!clean)
           return res.status(400).json({ error: "Member email is required" });
 
+        const me = getUserIdentity(req);
         const workspace = await workspacesCollection.findOne({
           _id: toId(workspaceId),
         });
         if (!workspace)
           return res.status(404).json({ error: "Workspace not found" });
+        // Admin-only: adding members changes workspace membership directly.
+        if (!isWorkspaceAdmin(workspace, me))
+          return res.status(403).json({ error: "Only admin can add members" });
 
         const exists = (workspace.members || []).find(
           (m) => normalizeEmail(m.email) === clean,
@@ -602,11 +606,8 @@ async function run() {
         });
         if (!workspace)
           return res.status(404).json({ error: "Workspace not found" });
-
-        const isAdmin = (workspace.members || []).some(
-          (m) => String(m.userId) === String(me.id) && m.role === "admin",
-        );
-        if (!isAdmin)
+        // Admin-only: deleting a workspace is a destructive management action.
+        if (!isWorkspaceAdmin(workspace, me))
           return res
             .status(403)
             .json({ error: "Only admin can delete workspace" });
@@ -636,9 +637,12 @@ async function run() {
       if (!workspace)
         return res.status(404).json({ error: "Workspace not found" });
 
+      // Get the verified requester identity from token / forwarded headers.
       const me = getUserIdentity(req);
-      if (!isWorkspaceMember(workspace, me))
-        return res.status(403).json({ error: "Forbidden workspace access" });
+      // Role-based access example:
+      // creating a project is treated as an admin-only workspace action.
+      if (!isWorkspaceAdmin(workspace, me))
+        return res.status(403).json({ error: "Only admin can create projects" });
 
       const project = {
         workspaceId: toId(workspaceId),
@@ -872,8 +876,9 @@ async function run() {
         });
         if (!workspace)
           return res.status(404).json({ error: "Workspace not found" });
-        if (!isWorkspaceMember(workspace, me))
-          return res.status(403).json({ error: "Forbidden workspace access" });
+        // Admin-only: deleting a project changes workspace structure.
+        if (!isWorkspaceAdmin(workspace, me))
+          return res.status(403).json({ error: "Only admin can delete projects" });
 
         await tasksCollection.deleteMany({
           workspaceId: toId(project.workspaceId),
@@ -1473,7 +1478,8 @@ async function run() {
               .status(404)
               .json({ ok: false, message: "Workspace not found" });
           }
-          if (!isWorkspaceMember(workspace, me)) {
+          // Admin-only: invite management belongs to workspace admins.
+          if (!isWorkspaceAdmin(workspace, me)) {
             return res.status(403).json({ ok: false, message: "Forbidden" });
           }
 
@@ -1850,7 +1856,6 @@ async function run() {
         });
       }
 
-      console.log("invitee:" + findInvite.email, "auth:" + userEmail);
       // if invitee email and user email doesn't match
       if (normalizeEmail(findInvite.email) !== userEmail)
         return res.status(403).json({
