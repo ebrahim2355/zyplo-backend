@@ -65,6 +65,9 @@ async function run() {
     const notificationsCollection = db.collection("notifications");
     const inviteCollection = db.collection("invites");
 
+    await notificationsCollection.createIndex({ userId: 1, createdAt: -1 });
+    await notificationsCollection.createIndex({ userId: 1, read: 1 });
+
     // register api
     const bcrypt = require("bcryptjs");
 
@@ -130,6 +133,32 @@ async function run() {
         .replace(/[^a-z0-9]+/g, "_")
         .replace(/^_+|_+$/g, "");
 
+
+    const createNotification = async ({ userId, text, type = "info", data = {} }) => {
+      if (!userId || !text) return;
+      try {
+        await notificationsCollection.insertOne({
+          userId: String(userId),
+          text: String(text),
+          type,
+          data,
+          read: false,
+          createdAt: now(),
+        });
+      } catch (e) {
+        console.error("Notification insert failed:", e?.message || e);
+      }
+    };
+
+    const getWorkspaceMemberById = (workspace, memberId) =>
+      (workspace?.members || []).find((m) => String(m.id) === String(memberId));
+
+    const getMemberUserId = (workspace, memberId) => {
+      const member = getWorkspaceMemberById(workspace, memberId);
+      return String(member?.userId || "");
+    };
+
+
     app.post("/auth/register", async (req, res) => {
       try {
         const { name, email, password, role } = req.body;
@@ -193,7 +222,7 @@ async function run() {
     });
 
     // login api
-    const jwt = require("jsonwebtoken"); //DUPLICATE REQUIRE
+    // const jwt = require("jsonwebtoken"); //DUPLICATE REQUIRE
 
     const MAX_LOGIN_ATTEMPTS = 5;
     const LOCK_TIME = 30 * 1000;
@@ -262,7 +291,7 @@ async function run() {
 
     // users api
 
-    app.get("/users", async (req, res) => {});
+    app.get("/users", async (req, res) => { });
 
     app.post("/users", async (req, res) => {
       const users = req.body;
@@ -662,6 +691,17 @@ async function run() {
       };
 
       const result = await tasksCollection.insertOne(task);
+
+      const assigneeUserId = getMemberUserId(workspace, task.assigneeId);
+      if (assigneeUserId && assigneeUserId !== String(me.id)) {
+        await createNotification({
+          userId: assigneeUserId,
+          text: `${me.name || "Someone"} assigned you: ${task.title}`,
+          type: "task_assigned",
+          data: { taskId: String(result.insertedId), workspaceId, projectId: String(task.projectId) },
+        });
+      }
+
       res.status(201).json({
         task: {
           id: String(result.insertedId),
@@ -743,6 +783,16 @@ async function run() {
         return res.status(404).json({ error: "Workspace not found" });
       if (!isWorkspaceMember(workspace, me))
         return res.status(403).json({ error: "Forbidden workspace access" });
+
+      const assigneeUserId = getMemberUserId(workspace, task.assigneeId);
+      if (assigneeUserId) {
+        await createNotification({
+          userId: assigneeUserId,
+          text: `${me.name || "Someone"} deleted task: ${task.title}`,
+          type: "task_deleted",
+          data: { taskId: String(task._id), workspaceId: String(task.workspaceId) },
+        });
+      }
 
       await tasksCollection.deleteOne({ _id: toId(taskId) });
       return res.json({ ok: true });
@@ -866,6 +916,7 @@ async function run() {
 
         const me = getUserIdentity(req);
         const session = client.startSession();
+        let pendingNotification = null;
 
         try {
           let responsePayload = null;
@@ -932,13 +983,13 @@ async function run() {
               String(targetBoardId) === String(sourceBoard._id)
                 ? sourceBoard
                 : await boardsCollection.findOne(
-                    {
-                      _id: targetBoardId,
-                      workspaceId: toId(task.workspaceId),
-                      projectId: toId(task.projectId),
-                    },
-                    { session },
-                  );
+                  {
+                    _id: targetBoardId,
+                    workspaceId: toId(task.workspaceId),
+                    projectId: toId(task.projectId),
+                  },
+                  { session },
+                );
             if (!destinationBoard) {
               throw { status: 404, message: "Destination board not found" };
             }
@@ -1078,6 +1129,18 @@ async function run() {
               .sort({ order: 1, createdAt: 1 })
               .toArray();
 
+            if (nextStatus !== task.status) {
+              const assigneeUserId = getMemberUserId(workspace, task.assigneeId);
+              if (assigneeUserId && assigneeUserId !== String(me.id)) {
+                pendingNotification = {
+                  userId: assigneeUserId,
+                  text: `${me.name || "Someone"} moved "${task.title}" to ${nextStatus}`,
+                  type: "task_moved",
+                  data: { taskId: String(task._id), workspaceId: String(task.workspaceId) },
+                };
+              }
+            }
+
             responsePayload = {
               boardId: String(responseBoard._id),
               projectId: String(project._id),
@@ -1113,6 +1176,10 @@ async function run() {
               })),
             };
           });
+
+          if (pendingNotification) {
+            await createNotification(pendingNotification);
+          }
 
           return res.json(responsePayload);
         } catch (error) {
@@ -1197,6 +1264,23 @@ async function run() {
 
       if (!t || !t._id)
         return res.status(404).json({ error: "Task not found" });
+
+      const changed = [];
+      if (patch.status && patch.status !== existingTask.status) changed.push(`status → ${patch.status}`);
+      if (patch.dueDate !== undefined && patch.dueDate !== existingTask.dueDate) changed.push("due date");
+      if (patch.title && patch.title !== existingTask.title) changed.push("title");
+
+      const newAssigneeId = patch.assigneeId ?? existingTask.assigneeId;
+      const assigneeUserId = getMemberUserId(workspace, newAssigneeId);
+
+      if (assigneeUserId && changed.length) {
+        await createNotification({
+          userId: assigneeUserId,
+          text: `${me.name || "Someone"} updated "${existingTask.title}" (${changed.join(", ")})`,
+          type: "task_updated",
+          data: { taskId: String(taskId), workspaceId: String(existingTask.workspaceId) },
+        });
+      }
 
       res.json({
         task: {
