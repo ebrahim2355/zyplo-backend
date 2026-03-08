@@ -78,6 +78,7 @@ async function run() {
       String(value || "")
         .trim()
         .toLowerCase();
+
     // Basic Gmail SMTP sender using .env credentials.
     const transporter = nodemailer.createTransport({
       service: "gmail",
@@ -302,7 +303,6 @@ async function run() {
     // GET /dashboard/bootstrap
     app.get("/dashboard/bootstrap", verifyToken, async (req, res) => {
       const me = getUserIdentity(req);
-      console.log(me);
       if (!me.id) return res.status(401).json({ error: "Unauthorized" });
 
       const workspaceDocs = await workspacesCollection
@@ -375,12 +375,14 @@ async function run() {
     });
 
     // POST /dashboard/workspaces
+    // Rifat Has Edited this Route //
     app.post("/dashboard/workspaces", verifyToken, async (req, res) => {
       const me = getUserIdentity(req);
       const { name, memberEmails = [] } = req.body || {};
       if (!name?.trim())
         return res.status(400).json({ error: "Workspace name is required" });
 
+      // Workspace's Member (admin only)
       const members = [
         {
           id: String(me.id),
@@ -390,20 +392,7 @@ async function run() {
           role: "admin", //changed to admin
         },
       ];
-
-      for (const raw of memberEmails) {
-        const email = normalizeEmail(raw);
-        if (!email || members.some((m) => normalizeEmail(m.email) === email))
-          continue;
-        members.push({
-          id: new ObjectId().toString(),
-          userId: "",
-          name: email.split("@")[0],
-          email,
-          role: "Member",
-        });
-      }
-
+      // Workspace Data in DB
       const doc = {
         name: name.trim(),
         slug: name
@@ -415,8 +404,143 @@ async function run() {
         createdBy: String(me.id),
         createdAt: now(),
       };
-
+      // Insert Workspace Data in DB
       const result = await workspacesCollection.insertOne(doc);
+
+      // Workspace Data
+      const workspaceId = String(result.insertedId);
+      const workspaceName = doc.name;
+
+      // Invitation Link
+      const frontendURL = process.env.FRONTEND_URL || "http://localhost:3000";
+      const seenInviteEmails = new Set();
+
+      //  invite data for db
+      for (const raw of memberEmails) {
+        const email = normalizeEmail(raw);
+        if (
+          !email ||
+          members.some((m) => normalizeEmail(m.email) === email) ||
+          seenInviteEmails.has(email)
+        )
+          continue;
+        seenInviteEmails.add(email);
+
+        const inviteRole = "member";
+
+        // Generate and Hash Token
+        const rawToken = crypto.randomBytes(32).toString("hex");
+        const hashedToken = crypto
+          .createHash("sha256")
+          .update(rawToken)
+          .digest("hex");
+
+        const inviteLink = `${frontendURL}/accept-invite/${rawToken}`;
+
+        const inviteData = {
+          email,
+          role: inviteRole,
+          workspaceId,
+          workspaceName,
+          status: "pending",
+          token: hashedToken,
+          createdAt: new Date(),
+          expiresAt: new Date(Date.now() + 2 * 24 * 60 * 60 * 1000),
+        };
+        // Save Invite Data
+        await inviteCollection.insertOne(inviteData);
+
+        // After invite data is stored, send invite email via Gmail SMTP.
+        try {
+          await sendInviteEmail({
+            to: email,
+            subject: `You're invited to join ${doc.name}`,
+            html: `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <style>
+        /* Responsive styles for mobile clients */
+        @media only screen and (max-width: 600px) {
+          .container { width: 100% !important; border-radius: 0 !important; border: none !important; }
+          .content { padding: 30px 20px !important; }
+          .button { width: 100% !important; text-align: center; display: block !important; box-sizing: border-box; }
+        }
+      </style>
+    </head>
+    <body style="margin:0;padding:0;background-color:#f4f7fa;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+      <table width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color:#f4f7fa;padding:40px 0;">
+        <tr>
+          <td align="center">
+            <table class="container" width="560" border="0" cellspacing="0" cellpadding="0" style="background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 10px 15px -3px rgba(0,0,0,0.1);border:1px solid #e5e7eb;">
+              
+              <tr>
+                <td class="content" style="padding:40px 40px 0 40px;">
+                  <img src="https://res.cloudinary.com/dsyahfiyo/image/upload/v1772881604/logo1_b7iv2u.png" 
+                       alt="${doc.name}" 
+                       width="48" 
+                       style="display:block; border:0; outline:none; text-decoration:none; max-width:120px; height:auto;">
+                </td>
+              </tr>
+
+              <tr>
+                <td class="content" style="padding:32px 40px 40px 40px;">
+                  <h1 style="margin:0 0 16px;font-size:24px;font-weight:700;color:#111827;line-height:1.2;">
+                    Join the workspace
+                  </h1>
+                  <p style="margin:0 0 20px;font-size:16px;line-height:1.6;color:#4b5563;">
+                    Hi there! You've been invited to join <strong>${doc.name}</strong> as a 
+                    <span style="background:#f3f4f6;color:#111827;padding:2px 8px;border-radius:4px;font-weight:600;font-size:14px;text-transform:capitalize;">${inviteRole}</span>.
+                  </p>
+                  <p style="margin:0 0 32px;font-size:16px;line-height:1.6;color:#4b5563;">
+                    Collaborate with your team, manage projects, and stay updated—all in one place.
+                  </p>
+                  
+                  <a href="${inviteLink}" class="button" style="display:inline-block;background-color:#4f46e5;color:#ffffff;text-decoration:none;font-size:16px;font-weight:600;padding:14px 30px;border-radius:8px;">
+                    Accept Invitation
+                  </a>
+                </td>
+              </tr>
+
+              <tr>
+                <td style="padding:30px 40px;background-color:#f9fafb;border-top:1px solid #e5e7eb;">
+                  <p style="margin:0 0 10px;font-size:12px;color:#9ca3af;text-transform:uppercase;letter-spacing:1px;font-weight:700;">
+                    Trouble with the button?
+                  </p>
+                  <p style="margin:0;font-size:13px;line-height:1.5;word-break:break-all;">
+                    <a href="${inviteLink}" style="color:#4f46e5;text-decoration:none;">${inviteLink}</a>
+                  </p>
+                </td>
+              </tr>
+            </table>
+
+            <table width="560" class="container" border="0" cellspacing="0" cellpadding="0">
+              <tr>
+                <td style="padding:24px 10px;text-align:center;">
+                  <p style="margin:0;font-size:12px;color:#9ca3af;line-height:1.4;">
+                    This invitation was sent to you by ${doc.name}.<br>
+                    If you weren't expecting this, you can safely ignore this email.
+                  </p>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </body>
+    </html>
+  `,
+          });
+        } catch (mailError) {
+          // Keep invite creation successful even if email sending fails.
+          console.error("SMTP send failed:", mailError?.message || mailError);
+        }
+      }
+
+      // Send Invite to Users
+
       res.status(201).json({
         workspace: {
           id: String(result.insertedId),
