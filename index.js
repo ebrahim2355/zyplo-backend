@@ -68,20 +68,25 @@ async function run() {
 
     await notificationsCollection.createIndex({ userId: 1, createdAt: -1 });
     await notificationsCollection.createIndex({ userId: 1, read: 1 });
+
     await timeLogsCollection.createIndex({ taskId: 1 });
     await timeLogsCollection.createIndex({ userId: 1 });
+    await timeLogsCollection.createIndex({ projectId: 1 });
     await timeLogsCollection.createIndex({ workspaceId: 1 });
+    await timeLogsCollection.createIndex({ startTime: 1 });
     try {
       await timeLogsCollection.createIndex(
         { userId: 1, endTime: 1 },
         {
-          name: "uniq_active_timer_per_user",
           unique: true,
           partialFilterExpression: { endTime: null },
         },
       );
     } catch (e) {
-      console.error("Time log unique index skipped:", e?.message || e);
+      const msg = String(e?.message || "");
+      if (!msg.includes("Index already exists with a different name")) {
+        console.error("Time log unique index skipped:", e?.message || e);
+      }
     }
 
     // register api
@@ -1052,7 +1057,8 @@ async function run() {
               Number(
                 t.remainingTime !== undefined
                   ? t.remainingTime
-                  : Number(t.estimatedTime || 0) - Number(t.totalTimeSpent || 0),
+                  : Number(t.estimatedTime || 0) -
+                      Number(t.totalTimeSpent || 0),
               ),
               0,
             ),
@@ -1382,7 +1388,7 @@ async function run() {
                         t.remainingTime !== undefined
                           ? t.remainingTime
                           : Number(t.estimatedTime || 0) -
-                            Number(t.totalTimeSpent || 0),
+                              Number(t.totalTimeSpent || 0),
                       ),
                       0,
                     ),
@@ -1627,6 +1633,7 @@ async function run() {
           userId: String(me.id),
           endTime: null,
         });
+
         if (active) {
           return res
             .status(409)
@@ -1679,14 +1686,14 @@ async function run() {
             { session },
           );
           if (!log) throw { status: 404, message: "Time log not found" };
-          if (log.endTime) throw { status: 400, message: "Timer already stopped" };
+          if (log.endTime)
+            throw { status: 400, message: "Timer already stopped" };
 
           const workspace = await workspacesCollection.findOne(
             { _id: toId(log.workspaceId) },
             { session },
           );
-          if (!workspace)
-            throw { status: 404, message: "Workspace not found" };
+          if (!workspace) throw { status: 404, message: "Workspace not found" };
           if (!isWorkspaceMember(workspace, me))
             throw { status: 403, message: "Forbidden workspace access" };
 
@@ -1872,7 +1879,10 @@ async function run() {
 
             const time = getTaskTimeFields(taskInside);
             const nextTotalTime = time.totalTimeSpent + duration;
-            const nextRemaining = Math.max(time.estimatedTime - nextTotalTime, 0);
+            const nextRemaining = Math.max(
+              time.estimatedTime - nextTotalTime,
+              0,
+            );
 
             await tasksCollection.updateOne(
               { _id: toId(task._id) },
@@ -2000,8 +2010,11 @@ async function run() {
         if (!isValidId(projectId))
           return res.status(400).json({ error: "Invalid projectId" });
 
-        const project = await projectsCollection.findOne({ _id: toId(projectId) });
-        if (!project) return res.status(404).json({ error: "Project not found" });
+        const project = await projectsCollection.findOne({
+          _id: toId(projectId),
+        });
+        if (!project)
+          return res.status(404).json({ error: "Project not found" });
 
         const workspace = await workspacesCollection.findOne({
           _id: toId(project.workspaceId),
@@ -2081,7 +2094,9 @@ async function run() {
           .filter((id) => !!id)
           .map((id) => toId(id));
         const projects = projectIds.length
-          ? await projectsCollection.find({ _id: { $in: projectIds } }).toArray()
+          ? await projectsCollection
+              .find({ _id: { $in: projectIds } })
+              .toArray()
           : [];
         const projectNameMap = new Map(
           projects.map((p) => [String(p._id), p.name || ""]),
@@ -2136,6 +2151,31 @@ async function run() {
             duration: toSeconds(l.duration, 0),
             description: l.description || "",
           })),
+        });
+      },
+    );
+
+    app.get(
+      "/dashboard/tasks/:taskId/time-summary",
+      verifyToken,
+      async (req, res) => {
+        const { taskId } = req.params;
+
+        const task = await tasksCollection.findOne({ _id: toId(taskId) });
+
+        if (!task) return res.status(404).json({ error: "Task not found" });
+
+        const estimated = Number(task.estimatedTime || 0);
+        const spent = Number(task.totalTimeSpent || 0);
+        const remaining = Math.max(estimated - spent, 0);
+
+        const progress = estimated ? Math.round((spent / estimated) * 100) : 0;
+
+        res.json({
+          estimated,
+          spent,
+          remaining,
+          progress,
         });
       },
     );
