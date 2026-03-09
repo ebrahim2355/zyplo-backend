@@ -316,7 +316,7 @@ async function run() {
 
     // users api
 
-    app.get("/users", async (req, res) => {});
+    app.get("/users", async (req, res) => { });
 
     app.post("/users", async (req, res) => {
       const users = req.body;
@@ -865,6 +865,8 @@ async function run() {
         // file attach - bayijid
         createdAt: now(),
         updatedAt: now(),
+        assignedByUserId: String(me.id || ""),
+        assignedByName: String(me.name || "User"),
       };
 
       const result = await tasksCollection.insertOne(task);
@@ -976,7 +978,7 @@ async function run() {
         return res.status(403).json({ error: "Forbidden workspace access" });
 
       const assigneeUserId = getMemberUserId(workspace, task.assigneeId);
-      if (assigneeUserId) {
+      if (assigneeUserId && assigneeUserId !== String(me.id)) {
         await createNotification({
           userId: assigneeUserId,
           text: `${me.name || "Someone"} deleted task: ${task.title}`,
@@ -1058,7 +1060,7 @@ async function run() {
                 t.remainingTime !== undefined
                   ? t.remainingTime
                   : Number(t.estimatedTime || 0) -
-                      Number(t.totalTimeSpent || 0),
+                  Number(t.totalTimeSpent || 0),
               ),
               0,
             ),
@@ -1128,6 +1130,7 @@ async function run() {
           let responsePayload = null;
 
           await session.withTransaction(async () => {
+            pendingNotification = null;
             const task = await tasksCollection.findOne(
               { _id: toId(taskId) },
               { session },
@@ -1189,13 +1192,13 @@ async function run() {
               String(targetBoardId) === String(sourceBoard._id)
                 ? sourceBoard
                 : await boardsCollection.findOne(
-                    {
-                      _id: targetBoardId,
-                      workspaceId: toId(task.workspaceId),
-                      projectId: toId(task.projectId),
-                    },
-                    { session },
-                  );
+                  {
+                    _id: targetBoardId,
+                    workspaceId: toId(task.workspaceId),
+                    projectId: toId(task.projectId),
+                  },
+                  { session },
+                );
             if (!destinationBoard) {
               throw { status: 404, message: "Destination board not found" };
             }
@@ -1336,18 +1339,17 @@ async function run() {
               .toArray();
 
             if (nextStatus !== task.status) {
-              const assigneeUserId = getMemberUserId(
-                workspace,
-                task.assigneeId,
-              );
-              if (assigneeUserId && assigneeUserId !== String(me.id)) {
+              const assignedByUserId = String(task.assignedByUserId || "");
+              if (assignedByUserId && assignedByUserId !== String(me.id)) {
                 pendingNotification = {
-                  userId: assigneeUserId,
-                  text: `${me.name || "Someone"} moved "${task.title}" to ${nextStatus}`,
-                  type: "task_moved",
+                  userId: assignedByUserId,
+                  text: `${task.assigneeName || "A member"} changed "${task.title}" status to ${nextStatus}`,
+                  type: "task_status_changed",
                   data: {
                     taskId: String(task._id),
                     workspaceId: String(task.workspaceId),
+                    projectId: task.projectId ? String(task.projectId) : "",
+                    changedByUserId: String(me.id || ""),
                   },
                 };
               }
@@ -1388,7 +1390,7 @@ async function run() {
                         t.remainingTime !== undefined
                           ? t.remainingTime
                           : Number(t.estimatedTime || 0) -
-                              Number(t.totalTimeSpent || 0),
+                          Number(t.totalTimeSpent || 0),
                       ),
                       0,
                     ),
@@ -1488,6 +1490,16 @@ async function run() {
       }
       $set.updatedAt = now();
 
+      const assigneeChanged =
+        patch.assigneeId !== undefined &&
+        String(patch.assigneeId || "") !== String(existingTask.assigneeId || "");
+
+      if (assigneeChanged) {
+        // if current actor changed assignment, treat them as latest assigner
+        $set.assignedByUserId = String(me.id || "");
+        $set.assignedByName = String(me.name || "User");
+      }
+
       const result = await tasksCollection.findOneAndUpdate(
         { _id: toId(taskId) },
         { $set },
@@ -1502,7 +1514,7 @@ async function run() {
 
       const changed = [];
       if (patch.status && patch.status !== existingTask.status)
-        changed.push(`status → ${patch.status}`);
+        changed.push(`status -> ${patch.status}`);
       if (patch.dueDate !== undefined && patch.dueDate !== existingTask.dueDate)
         changed.push("due date");
       if (patch.title && patch.title !== existingTask.title)
@@ -1511,11 +1523,20 @@ async function run() {
       const newAssigneeId = patch.assigneeId ?? existingTask.assigneeId;
       const assigneeUserId = getMemberUserId(workspace, newAssigneeId);
 
-      if (assigneeUserId && changed.length) {
+      // notify for meaningful updates OR assignment change, but never notify self
+      if (
+        assigneeUserId &&
+        assigneeUserId !== String(me.id) &&
+        (changed.length > 0 || assigneeChanged)
+      ) {
+        const message = assigneeChanged
+          ? `${me.name || "Someone"} assigned you task: ${t.title || existingTask.title}`
+          : `${me.name || "Someone"} updated "${existingTask.title}" (${changed.join(", ")})`;
+
         await createNotification({
           userId: assigneeUserId,
-          text: `${me.name || "Someone"} updated "${existingTask.title}" (${changed.join(", ")})`,
-          type: "task_updated",
+          text: message,
+          type: assigneeChanged ? "task_assigned" : "task_updated",
           data: {
             taskId: String(taskId),
             workspaceId: String(existingTask.workspaceId),
@@ -2095,8 +2116,8 @@ async function run() {
           .map((id) => toId(id));
         const projects = projectIds.length
           ? await projectsCollection
-              .find({ _id: { $in: projectIds } })
-              .toArray()
+            .find({ _id: { $in: projectIds } })
+            .toArray()
           : [];
         const projectNameMap = new Map(
           projects.map((p) => [String(p._id), p.name || ""]),
