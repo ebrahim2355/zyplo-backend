@@ -62,11 +62,27 @@ async function run() {
     const projectsCollection = db.collection("projects");
     const boardsCollection = db.collection("boards");
     const tasksCollection = db.collection("tasks");
+    const timeLogsCollection = db.collection("timeLogs");
     const notificationsCollection = db.collection("notifications");
     const inviteCollection = db.collection("invites");
 
     await notificationsCollection.createIndex({ userId: 1, createdAt: -1 });
     await notificationsCollection.createIndex({ userId: 1, read: 1 });
+    await timeLogsCollection.createIndex({ taskId: 1 });
+    await timeLogsCollection.createIndex({ userId: 1 });
+    await timeLogsCollection.createIndex({ workspaceId: 1 });
+    try {
+      await timeLogsCollection.createIndex(
+        { userId: 1, endTime: 1 },
+        {
+          name: "uniq_active_timer_per_user",
+          unique: true,
+          partialFilterExpression: { endTime: null },
+        },
+      );
+    } catch (e) {
+      console.error("Time log unique index skipped:", e?.message || e);
+    }
 
     // register api
     const bcrypt = require("bcryptjs");
@@ -134,8 +150,12 @@ async function run() {
         .replace(/[^a-z0-9]+/g, "_")
         .replace(/^_+|_+$/g, "");
 
-
-    const createNotification = async ({ userId, text, type = "info", data = {} }) => {
+    const createNotification = async ({
+      userId,
+      text,
+      type = "info",
+      data = {},
+    }) => {
       if (!userId || !text) return;
       try {
         await notificationsCollection.insertOne({
@@ -158,7 +178,6 @@ async function run() {
       const member = getWorkspaceMemberById(workspace, memberId);
       return String(member?.userId || "");
     };
-
 
     app.post("/auth/register", async (req, res) => {
       try {
@@ -292,7 +311,7 @@ async function run() {
 
     // users api
 
-    app.get("/users", async (req, res) => { });
+    app.get("/users", async (req, res) => {});
 
     app.post("/users", async (req, res) => {
       const users = req.body;
@@ -359,6 +378,16 @@ async function run() {
           assigneeName: t.assigneeName || "Unassigned",
           createdAt: t.createdAt,
           updatedAt: t.updatedAt || "",
+          estimatedTime: Number(t.estimatedTime || 0),
+          totalTimeSpent: Number(t.totalTimeSpent || 0),
+          remainingTime: Math.max(
+            Number(
+              t.remainingTime !== undefined
+                ? t.remainingTime
+                : Number(t.estimatedTime || 0) - Number(t.totalTimeSpent || 0),
+            ),
+            0,
+          ),
           // bayijid - file attach
           attachments: t.attachments || [],
           // bayijid - file attach
@@ -615,6 +644,7 @@ async function run() {
         await projectsCollection.deleteMany({ workspaceId: toId(workspaceId) });
         await boardsCollection.deleteMany({ workspaceId: toId(workspaceId) });
         await tasksCollection.deleteMany({ workspaceId: toId(workspaceId) });
+        await timeLogsCollection.deleteMany({ workspaceId: toId(workspaceId) });
         await workspacesCollection.deleteOne({ _id: toId(workspaceId) });
 
         return res.json({ ok: true });
@@ -642,7 +672,9 @@ async function run() {
       // Role-based access example:
       // creating a project is treated as an admin-only workspace action.
       if (!isWorkspaceAdmin(workspace, me))
-        return res.status(403).json({ error: "Only admin can create projects" });
+        return res
+          .status(403)
+          .json({ error: "Only admin can create projects" });
 
       const project = {
         workspaceId: toId(workspaceId),
@@ -725,6 +757,7 @@ async function run() {
         status = "todo",
         dueDate = "",
         assigneeId = "",
+        estimatedTime = 0,
         // bayijid - file attach
         attachments = [],
         // bayijid - file attach
@@ -777,6 +810,14 @@ async function run() {
       if (!hasColumn)
         return res.status(400).json({ error: "Invalid columnId for board" });
 
+      const parsedEstimatedTime = Number(estimatedTime);
+      if (!Number.isFinite(parsedEstimatedTime) || parsedEstimatedTime < 0) {
+        return res
+          .status(400)
+          .json({ error: "estimatedTime must be a non-negative number" });
+      }
+      const safeEstimatedTime = Math.floor(parsedEstimatedTime);
+
       const assignee =
         (workspace.members || []).find((m) => m.id === assigneeId) ||
         (workspace.members || [])[0] ||
@@ -811,6 +852,9 @@ async function run() {
         dueDate,
         assigneeId: assignee?.id || "",
         assigneeName: assignee?.name || "Unassigned",
+        estimatedTime: safeEstimatedTime,
+        totalTimeSpent: 0,
+        remainingTime: safeEstimatedTime,
         // file attach - bayijid
         attachments: Array.isArray(attachments) ? attachments : [],
         // file attach - bayijid
@@ -826,7 +870,11 @@ async function run() {
           userId: assigneeUserId,
           text: `${me.name || "Someone"} assigned you: ${task.title}`,
           type: "task_assigned",
-          data: { taskId: String(result.insertedId), workspaceId, projectId: String(task.projectId) },
+          data: {
+            taskId: String(result.insertedId),
+            workspaceId,
+            projectId: String(task.projectId),
+          },
         });
       }
 
@@ -846,6 +894,9 @@ async function run() {
           dueDate: task.dueDate,
           assigneeId: task.assigneeId,
           assigneeName: task.assigneeName,
+          estimatedTime: task.estimatedTime,
+          totalTimeSpent: task.totalTimeSpent,
+          remainingTime: task.remainingTime,
           createdAt: task.createdAt,
           // file attach - helal / bayijid
           attachments: task.attachments || [],
@@ -878,9 +929,15 @@ async function run() {
           return res.status(404).json({ error: "Workspace not found" });
         // Admin-only: deleting a project changes workspace structure.
         if (!isWorkspaceAdmin(workspace, me))
-          return res.status(403).json({ error: "Only admin can delete projects" });
+          return res
+            .status(403)
+            .json({ error: "Only admin can delete projects" });
 
         await tasksCollection.deleteMany({
+          workspaceId: toId(project.workspaceId),
+          projectId: toId(projectId),
+        });
+        await timeLogsCollection.deleteMany({
           workspaceId: toId(project.workspaceId),
           projectId: toId(projectId),
         });
@@ -919,11 +976,15 @@ async function run() {
           userId: assigneeUserId,
           text: `${me.name || "Someone"} deleted task: ${task.title}`,
           type: "task_deleted",
-          data: { taskId: String(task._id), workspaceId: String(task.workspaceId) },
+          data: {
+            taskId: String(task._id),
+            workspaceId: String(task.workspaceId),
+          },
         });
       }
 
       await tasksCollection.deleteOne({ _id: toId(taskId) });
+      await timeLogsCollection.deleteMany({ taskId: toId(taskId) });
       return res.json({ ok: true });
     });
 
@@ -985,6 +1046,16 @@ async function run() {
             assigneeName: t.assigneeName || "Unassigned",
             createdAt: t.createdAt,
             updatedAt: t.updatedAt || "",
+            estimatedTime: Number(t.estimatedTime || 0),
+            totalTimeSpent: Number(t.totalTimeSpent || 0),
+            remainingTime: Math.max(
+              Number(
+                t.remainingTime !== undefined
+                  ? t.remainingTime
+                  : Number(t.estimatedTime || 0) - Number(t.totalTimeSpent || 0),
+              ),
+              0,
+            ),
             // file attach - helal / bayijid
             attachments: t.attachments || [],
             // file attach - helal / bayijid
@@ -1112,13 +1183,13 @@ async function run() {
               String(targetBoardId) === String(sourceBoard._id)
                 ? sourceBoard
                 : await boardsCollection.findOne(
-                  {
-                    _id: targetBoardId,
-                    workspaceId: toId(task.workspaceId),
-                    projectId: toId(task.projectId),
-                  },
-                  { session },
-                );
+                    {
+                      _id: targetBoardId,
+                      workspaceId: toId(task.workspaceId),
+                      projectId: toId(task.projectId),
+                    },
+                    { session },
+                  );
             if (!destinationBoard) {
               throw { status: 404, message: "Destination board not found" };
             }
@@ -1259,13 +1330,19 @@ async function run() {
               .toArray();
 
             if (nextStatus !== task.status) {
-              const assigneeUserId = getMemberUserId(workspace, task.assigneeId);
+              const assigneeUserId = getMemberUserId(
+                workspace,
+                task.assigneeId,
+              );
               if (assigneeUserId && assigneeUserId !== String(me.id)) {
                 pendingNotification = {
                   userId: assigneeUserId,
                   text: `${me.name || "Someone"} moved "${task.title}" to ${nextStatus}`,
                   type: "task_moved",
-                  data: { taskId: String(task._id), workspaceId: String(task.workspaceId) },
+                  data: {
+                    taskId: String(task._id),
+                    workspaceId: String(task.workspaceId),
+                  },
                 };
               }
             }
@@ -1298,6 +1375,17 @@ async function run() {
                     assigneeName: t.assigneeName || "Unassigned",
                     createdAt: t.createdAt,
                     updatedAt: t.updatedAt || "",
+                    estimatedTime: Number(t.estimatedTime || 0),
+                    totalTimeSpent: Number(t.totalTimeSpent || 0),
+                    remainingTime: Math.max(
+                      Number(
+                        t.remainingTime !== undefined
+                          ? t.remainingTime
+                          : Number(t.estimatedTime || 0) -
+                            Number(t.totalTimeSpent || 0),
+                      ),
+                      0,
+                    ),
                     // file attach - helal / bayijid
                     attachments: t.attachments || [],
                     // file attach - helal / bayijid
@@ -1362,6 +1450,18 @@ async function run() {
       if (Array.isArray(patch.attachments)) {
         $set.attachments = patch.attachments;
       }
+      if (patch.estimatedTime !== undefined) {
+        const parsedEstimatedTime = Number(patch.estimatedTime);
+        if (!Number.isFinite(parsedEstimatedTime) || parsedEstimatedTime < 0) {
+          return res
+            .status(400)
+            .json({ error: "estimatedTime must be a non-negative number" });
+        }
+        const safeEstimatedTime = Math.floor(parsedEstimatedTime);
+        const currentTotal = Number(existingTask.totalTimeSpent || 0);
+        $set.estimatedTime = safeEstimatedTime;
+        $set.remainingTime = Math.max(safeEstimatedTime - currentTotal, 0);
+      }
 
       if (patch.projectId !== undefined) {
         if (!patch.projectId) {
@@ -1395,9 +1495,12 @@ async function run() {
         return res.status(404).json({ error: "Task not found" });
 
       const changed = [];
-      if (patch.status && patch.status !== existingTask.status) changed.push(`status → ${patch.status}`);
-      if (patch.dueDate !== undefined && patch.dueDate !== existingTask.dueDate) changed.push("due date");
-      if (patch.title && patch.title !== existingTask.title) changed.push("title");
+      if (patch.status && patch.status !== existingTask.status)
+        changed.push(`status → ${patch.status}`);
+      if (patch.dueDate !== undefined && patch.dueDate !== existingTask.dueDate)
+        changed.push("due date");
+      if (patch.title && patch.title !== existingTask.title)
+        changed.push("title");
 
       const newAssigneeId = patch.assigneeId ?? existingTask.assigneeId;
       const assigneeUserId = getMemberUserId(workspace, newAssigneeId);
@@ -1407,7 +1510,10 @@ async function run() {
           userId: assigneeUserId,
           text: `${me.name || "Someone"} updated "${existingTask.title}" (${changed.join(", ")})`,
           type: "task_updated",
-          data: { taskId: String(taskId), workspaceId: String(existingTask.workspaceId) },
+          data: {
+            taskId: String(taskId),
+            workspaceId: String(existingTask.workspaceId),
+          },
         });
       }
 
@@ -1429,6 +1535,16 @@ async function run() {
           assigneeName: t.assigneeName || "Unassigned",
           createdAt: t.createdAt,
           updatedAt: t.updatedAt || "",
+          estimatedTime: Number(t.estimatedTime || 0),
+          totalTimeSpent: Number(t.totalTimeSpent || 0),
+          remainingTime: Math.max(
+            Number(
+              t.remainingTime !== undefined
+                ? t.remainingTime
+                : Number(t.estimatedTime || 0) - Number(t.totalTimeSpent || 0),
+            ),
+            0,
+          ),
           // file attach - helal / bayijid
           attachments: t.attachments || [],
           // file attach - helal / bayijid
@@ -1447,6 +1563,580 @@ async function run() {
           { $set: { read: true } },
         );
         res.json({ ok: true });
+      },
+    );
+
+    // time tracking api
+    const toSeconds = (value, fallback = 0) => {
+      const n = Number(value);
+      if (!Number.isFinite(n) || n < 0) return fallback;
+      return Math.floor(n);
+    };
+
+    const getTaskTimeFields = (task = {}) => {
+      const estimatedTime = toSeconds(task.estimatedTime, 0);
+      const totalTimeSpent = toSeconds(task.totalTimeSpent, 0);
+      const remainingTime = Math.max(
+        toSeconds(task.remainingTime, estimatedTime - totalTimeSpent),
+        0,
+      );
+      return { estimatedTime, totalTimeSpent, remainingTime };
+    };
+
+    const parseDateValue = (value) => {
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return null;
+      return d;
+    };
+
+    const parseBoundaryDate = (value, endOfDay = false) => {
+      if (value === undefined || value === null || value === "") return null;
+      const raw = String(value).trim();
+      const parsed = parseDateValue(raw);
+      if (!parsed) return null;
+      if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+        if (endOfDay) parsed.setUTCHours(23, 59, 59, 999);
+        else parsed.setUTCHours(0, 0, 0, 0);
+      }
+      return parsed;
+    };
+
+    // POST /dashboard/tasks/:taskId/time/start
+    app.post(
+      "/dashboard/tasks/:taskId/time/start",
+      verifyToken,
+      async (req, res) => {
+        const { taskId } = req.params;
+        const me = getUserIdentity(req);
+        if (!me.id) return res.status(401).json({ error: "Unauthorized" });
+        if (!isValidId(taskId))
+          return res.status(400).json({ error: "Invalid taskId" });
+
+        const task = await tasksCollection.findOne({ _id: toId(taskId) });
+        if (!task) return res.status(404).json({ error: "Task not found" });
+
+        const workspace = await workspacesCollection.findOne({
+          _id: toId(task.workspaceId),
+        });
+        if (!workspace)
+          return res.status(404).json({ error: "Workspace not found" });
+        if (!isWorkspaceMember(workspace, me))
+          return res.status(403).json({ error: "Forbidden workspace access" });
+
+        const active = await timeLogsCollection.findOne({
+          userId: String(me.id),
+          endTime: null,
+        });
+        if (active) {
+          return res
+            .status(409)
+            .json({ error: "You already have an active timer" });
+        }
+
+        const startTime = new Date();
+        try {
+          const result = await timeLogsCollection.insertOne({
+            taskId: toId(task._id),
+            workspaceId: toId(task.workspaceId),
+            projectId: task.projectId ? toId(task.projectId) : null,
+            userId: String(me.id),
+            startTime,
+            endTime: null,
+            duration: 0,
+            description: String(req.body?.description || "").trim(),
+            createdAt: new Date(),
+          });
+          return res.status(201).json({
+            logId: String(result.insertedId),
+            startTime,
+          });
+        } catch (e) {
+          if (e?.code === 11000) {
+            return res
+              .status(409)
+              .json({ error: "You already have an active timer" });
+          }
+          console.error(e);
+          return res.status(500).json({ error: "Failed to start timer" });
+        }
+      },
+    );
+
+    // POST /dashboard/time/:logId/stop
+    app.post("/dashboard/time/:logId/stop", verifyToken, async (req, res) => {
+      const { logId } = req.params;
+      const me = getUserIdentity(req);
+      if (!me.id) return res.status(401).json({ error: "Unauthorized" });
+      if (!isValidId(logId))
+        return res.status(400).json({ error: "Invalid logId" });
+
+      const session = client.startSession();
+      let duration = 0;
+      try {
+        await session.withTransaction(async () => {
+          const log = await timeLogsCollection.findOne(
+            { _id: toId(logId), userId: String(me.id) },
+            { session },
+          );
+          if (!log) throw { status: 404, message: "Time log not found" };
+          if (log.endTime) throw { status: 400, message: "Timer already stopped" };
+
+          const workspace = await workspacesCollection.findOne(
+            { _id: toId(log.workspaceId) },
+            { session },
+          );
+          if (!workspace)
+            throw { status: 404, message: "Workspace not found" };
+          if (!isWorkspaceMember(workspace, me))
+            throw { status: 403, message: "Forbidden workspace access" };
+
+          const start = parseDateValue(log.startTime);
+          if (!start) throw { status: 400, message: "Invalid log startTime" };
+          const endTime = new Date();
+          duration = Math.max(
+            0,
+            Math.floor((endTime.getTime() - start.getTime()) / 1000),
+          );
+
+          await timeLogsCollection.updateOne(
+            { _id: toId(logId) },
+            { $set: { endTime, duration } },
+            { session },
+          );
+
+          const task = await tasksCollection.findOne(
+            { _id: toId(log.taskId) },
+            { session },
+          );
+          if (!task) throw { status: 404, message: "Task not found" };
+
+          const time = getTaskTimeFields(task);
+          const nextTotalTime = time.totalTimeSpent + duration;
+          const nextRemaining = Math.max(time.estimatedTime - nextTotalTime, 0);
+
+          await tasksCollection.updateOne(
+            { _id: toId(task._id) },
+            {
+              $set: {
+                totalTimeSpent: nextTotalTime,
+                remainingTime: nextRemaining,
+                updatedAt: now(),
+              },
+            },
+            { session },
+          );
+        });
+
+        return res.json({ duration });
+      } catch (e) {
+        if (e?.status && e?.message) {
+          return res.status(e.status).json({ error: e.message });
+        }
+        console.error(e);
+        return res.status(500).json({ error: "Failed to stop timer" });
+      } finally {
+        await session.endSession();
+      }
+    });
+
+    // GET /dashboard/tasks/:taskId/time
+    app.get("/dashboard/tasks/:taskId/time", verifyToken, async (req, res) => {
+      const { taskId } = req.params;
+      const me = getUserIdentity(req);
+      if (!isValidId(taskId))
+        return res.status(400).json({ error: "Invalid taskId" });
+
+      const task = await tasksCollection.findOne({ _id: toId(taskId) });
+      if (!task) return res.status(404).json({ error: "Task not found" });
+
+      const workspace = await workspacesCollection.findOne({
+        _id: toId(task.workspaceId),
+      });
+      if (!workspace)
+        return res.status(404).json({ error: "Workspace not found" });
+      if (!isWorkspaceMember(workspace, me))
+        return res.status(403).json({ error: "Forbidden workspace access" });
+
+      const logs = await timeLogsCollection
+        .find({ taskId: toId(taskId) })
+        .sort({ startTime: -1 })
+        .toArray();
+
+      return res.json(
+        logs.map((l) => ({
+          id: String(l._id),
+          userId: String(l.userId || ""),
+          startTime: l.startTime || null,
+          endTime: l.endTime || null,
+          duration: toSeconds(l.duration, 0),
+        })),
+      );
+    });
+
+    // GET /dashboard/time/active
+    app.get("/dashboard/time/active", verifyToken, async (req, res) => {
+      const me = getUserIdentity(req);
+      if (!me.id) return res.status(401).json({ error: "Unauthorized" });
+
+      const active = await timeLogsCollection.findOne(
+        {
+          userId: String(me.id),
+          endTime: null,
+        },
+        { sort: { startTime: -1 } },
+      );
+
+      if (!active) return res.json({ activeTimer: null });
+
+      return res.json({
+        activeTimer: {
+          id: String(active._id),
+          taskId: String(active.taskId),
+          workspaceId: String(active.workspaceId),
+          projectId: active.projectId ? String(active.projectId) : "",
+          userId: String(active.userId || ""),
+          startTime: active.startTime || null,
+          endTime: null,
+          duration: toSeconds(active.duration, 0),
+          description: active.description || "",
+        },
+      });
+    });
+
+    // POST /dashboard/tasks/:taskId/time/manual
+    app.post(
+      "/dashboard/tasks/:taskId/time/manual",
+      verifyToken,
+      async (req, res) => {
+        const { taskId } = req.params;
+        const me = getUserIdentity(req);
+        if (!me.id) return res.status(401).json({ error: "Unauthorized" });
+        if (!isValidId(taskId))
+          return res.status(400).json({ error: "Invalid taskId" });
+
+        const { startTime, endTime, description = "" } = req.body || {};
+        const startAt = parseDateValue(startTime);
+        const endAt = parseDateValue(endTime);
+        if (!startAt || !endAt) {
+          return res
+            .status(400)
+            .json({ error: "startTime and endTime must be valid dates" });
+        }
+        if (endAt <= startAt) {
+          return res
+            .status(400)
+            .json({ error: "endTime must be greater than startTime" });
+        }
+
+        const task = await tasksCollection.findOne({ _id: toId(taskId) });
+        if (!task) return res.status(404).json({ error: "Task not found" });
+
+        const workspace = await workspacesCollection.findOne({
+          _id: toId(task.workspaceId),
+        });
+        if (!workspace)
+          return res.status(404).json({ error: "Workspace not found" });
+        if (!isWorkspaceMember(workspace, me))
+          return res.status(403).json({ error: "Forbidden workspace access" });
+
+        const duration = Math.max(
+          0,
+          Math.floor((endAt.getTime() - startAt.getTime()) / 1000),
+        );
+
+        const session = client.startSession();
+        let insertedLogId = null;
+        try {
+          await session.withTransaction(async () => {
+            const insertResult = await timeLogsCollection.insertOne(
+              {
+                taskId: toId(task._id),
+                workspaceId: toId(task.workspaceId),
+                projectId: task.projectId ? toId(task.projectId) : null,
+                userId: String(me.id),
+                startTime: startAt,
+                endTime: endAt,
+                duration,
+                description: String(description).trim(),
+                createdAt: new Date(),
+              },
+              { session },
+            );
+            insertedLogId = insertResult.insertedId;
+
+            const taskInside = await tasksCollection.findOne(
+              { _id: toId(task._id) },
+              { session },
+            );
+            if (!taskInside) throw { status: 404, message: "Task not found" };
+
+            const time = getTaskTimeFields(taskInside);
+            const nextTotalTime = time.totalTimeSpent + duration;
+            const nextRemaining = Math.max(time.estimatedTime - nextTotalTime, 0);
+
+            await tasksCollection.updateOne(
+              { _id: toId(task._id) },
+              {
+                $set: {
+                  totalTimeSpent: nextTotalTime,
+                  remainingTime: nextRemaining,
+                  updatedAt: now(),
+                },
+              },
+              { session },
+            );
+          });
+
+          return res.status(201).json({
+            logId: String(insertedLogId),
+            duration,
+          });
+        } catch (e) {
+          if (e?.status && e?.message) {
+            return res.status(e.status).json({ error: e.message });
+          }
+          console.error(e);
+          return res.status(500).json({ error: "Failed to save manual time" });
+        } finally {
+          await session.endSession();
+        }
+      },
+    );
+
+    // GET /dashboard/reports/timesheet
+    app.get("/dashboard/reports/timesheet", verifyToken, async (req, res) => {
+      const me = getUserIdentity(req);
+      if (!me.id) return res.status(401).json({ error: "Unauthorized" });
+
+      const { userId = "", startDate = "", endDate = "" } = req.query || {};
+      const targetUserId = String(userId || me.id);
+      const startAt = parseBoundaryDate(startDate);
+      const endAt = parseBoundaryDate(endDate, true);
+
+      if (startDate && !startAt)
+        return res.status(400).json({ error: "Invalid startDate" });
+      if (endDate && !endAt)
+        return res.status(400).json({ error: "Invalid endDate" });
+      if (startAt && endAt && startAt > endAt) {
+        return res
+          .status(400)
+          .json({ error: "startDate must be before or equal to endDate" });
+      }
+
+      let workspaceFilter = null;
+      if (targetUserId !== String(me.id)) {
+        const adminWorkspaces = await workspacesCollection
+          .find({
+            members: {
+              $elemMatch: {
+                userId: String(me.id),
+                role: "admin",
+              },
+            },
+          })
+          .toArray();
+
+        const sharedWorkspaceIds = adminWorkspaces
+          .filter((w) =>
+            (w.members || []).some(
+              (m) => String(m.userId || "") === String(targetUserId),
+            ),
+          )
+          .map((w) => toId(w._id));
+
+        if (!sharedWorkspaceIds.length) {
+          return res.status(403).json({ error: "Forbidden timesheet access" });
+        }
+        workspaceFilter = { $in: sharedWorkspaceIds };
+      }
+
+      const match = {
+        userId: targetUserId,
+        endTime: { $ne: null },
+      };
+      if (workspaceFilter) match.workspaceId = workspaceFilter;
+      if (startAt || endAt) {
+        match.startTime = {};
+        if (startAt) match.startTime.$gte = startAt;
+        if (endAt) match.startTime.$lte = endAt;
+      }
+
+      const data = await timeLogsCollection
+        .aggregate([
+          { $match: match },
+          {
+            $group: {
+              _id: {
+                $dateToString: {
+                  format: "%Y-%m-%d",
+                  date: "$startTime",
+                  timezone: "UTC",
+                },
+              },
+              totalTime: { $sum: { $ifNull: ["$duration", 0] } },
+            },
+          },
+          { $sort: { _id: 1 } },
+          {
+            $project: {
+              _id: 0,
+              date: "$_id",
+              totalTime: { $toInt: "$totalTime" },
+            },
+          },
+        ])
+        .toArray();
+
+      return res.json(data);
+    });
+
+    // GET /dashboard/reports/project/:projectId
+    app.get(
+      "/dashboard/reports/project/:projectId",
+      verifyToken,
+      async (req, res) => {
+        const { projectId } = req.params;
+        const me = getUserIdentity(req);
+        if (!isValidId(projectId))
+          return res.status(400).json({ error: "Invalid projectId" });
+
+        const project = await projectsCollection.findOne({ _id: toId(projectId) });
+        if (!project) return res.status(404).json({ error: "Project not found" });
+
+        const workspace = await workspacesCollection.findOne({
+          _id: toId(project.workspaceId),
+        });
+        if (!workspace)
+          return res.status(404).json({ error: "Workspace not found" });
+        if (!isWorkspaceMember(workspace, me))
+          return res.status(403).json({ error: "Forbidden workspace access" });
+
+        const rows = await timeLogsCollection
+          .aggregate([
+            {
+              $match: {
+                projectId: toId(projectId),
+                endTime: { $ne: null },
+              },
+            },
+            {
+              $group: {
+                _id: "$userId",
+                totalTime: { $sum: { $ifNull: ["$duration", 0] } },
+              },
+            },
+            { $sort: { totalTime: -1 } },
+            {
+              $project: {
+                _id: 0,
+                userId: "$_id",
+                totalTime: { $toInt: "$totalTime" },
+              },
+            },
+          ])
+          .toArray();
+
+        return res.json(rows);
+      },
+    );
+
+    // GET /dashboard/reports/workspace/:workspaceId
+    app.get(
+      "/dashboard/reports/workspace/:workspaceId",
+      verifyToken,
+      async (req, res) => {
+        const { workspaceId } = req.params;
+        const me = getUserIdentity(req);
+        if (!isValidId(workspaceId))
+          return res.status(400).json({ error: "Invalid workspaceId" });
+
+        const workspace = await workspacesCollection.findOne({
+          _id: toId(workspaceId),
+        });
+        if (!workspace)
+          return res.status(404).json({ error: "Workspace not found" });
+        if (!isWorkspaceMember(workspace, me))
+          return res.status(403).json({ error: "Forbidden workspace access" });
+
+        const rows = await timeLogsCollection
+          .aggregate([
+            {
+              $match: {
+                workspaceId: toId(workspaceId),
+                endTime: { $ne: null },
+              },
+            },
+            {
+              $group: {
+                _id: "$projectId",
+                totalTime: { $sum: { $ifNull: ["$duration", 0] } },
+              },
+            },
+            { $sort: { totalTime: -1 } },
+          ])
+          .toArray();
+
+        const projectIds = rows
+          .map((r) => r._id)
+          .filter((id) => !!id)
+          .map((id) => toId(id));
+        const projects = projectIds.length
+          ? await projectsCollection.find({ _id: { $in: projectIds } }).toArray()
+          : [];
+        const projectNameMap = new Map(
+          projects.map((p) => [String(p._id), p.name || ""]),
+        );
+
+        return res.json(
+          rows.map((r) => ({
+            projectId: r._id ? String(r._id) : "",
+            projectName: r._id ? projectNameMap.get(String(r._id)) || "" : "",
+            totalTime: toSeconds(r.totalTime, 0),
+          })),
+        );
+      },
+    );
+
+    // GET /dashboard/reports/task/:taskId
+    app.get(
+      "/dashboard/reports/task/:taskId",
+      verifyToken,
+      async (req, res) => {
+        const { taskId } = req.params;
+        const me = getUserIdentity(req);
+        if (!isValidId(taskId))
+          return res.status(400).json({ error: "Invalid taskId" });
+
+        const task = await tasksCollection.findOne({ _id: toId(taskId) });
+        if (!task) return res.status(404).json({ error: "Task not found" });
+
+        const workspace = await workspacesCollection.findOne({
+          _id: toId(task.workspaceId),
+        });
+        if (!workspace)
+          return res.status(404).json({ error: "Workspace not found" });
+        if (!isWorkspaceMember(workspace, me))
+          return res.status(403).json({ error: "Forbidden workspace access" });
+
+        const logs = await timeLogsCollection
+          .find({ taskId: toId(taskId) })
+          .sort({ startTime: -1 })
+          .toArray();
+
+        const time = getTaskTimeFields(task);
+        return res.json({
+          estimatedTime: time.estimatedTime,
+          totalTimeSpent: time.totalTimeSpent,
+          remainingTime: time.remainingTime,
+          logs: logs.map((l) => ({
+            id: String(l._id),
+            userId: String(l.userId || ""),
+            startTime: l.startTime || null,
+            endTime: l.endTime || null,
+            duration: toSeconds(l.duration, 0),
+            description: l.description || "",
+          })),
+        });
       },
     );
 
