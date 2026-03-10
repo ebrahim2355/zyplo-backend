@@ -316,7 +316,7 @@ async function run() {
 
     // users api
 
-    app.get("/users", async (req, res) => { });
+    app.get("/users", async (req, res) => {});
 
     app.post("/users", async (req, res) => {
       const users = req.body;
@@ -1060,7 +1060,7 @@ async function run() {
                 t.remainingTime !== undefined
                   ? t.remainingTime
                   : Number(t.estimatedTime || 0) -
-                  Number(t.totalTimeSpent || 0),
+                      Number(t.totalTimeSpent || 0),
               ),
               0,
             ),
@@ -1192,13 +1192,13 @@ async function run() {
               String(targetBoardId) === String(sourceBoard._id)
                 ? sourceBoard
                 : await boardsCollection.findOne(
-                  {
-                    _id: targetBoardId,
-                    workspaceId: toId(task.workspaceId),
-                    projectId: toId(task.projectId),
-                  },
-                  { session },
-                );
+                    {
+                      _id: targetBoardId,
+                      workspaceId: toId(task.workspaceId),
+                      projectId: toId(task.projectId),
+                    },
+                    { session },
+                  );
             if (!destinationBoard) {
               throw { status: 404, message: "Destination board not found" };
             }
@@ -1390,7 +1390,7 @@ async function run() {
                         t.remainingTime !== undefined
                           ? t.remainingTime
                           : Number(t.estimatedTime || 0) -
-                          Number(t.totalTimeSpent || 0),
+                              Number(t.totalTimeSpent || 0),
                       ),
                       0,
                     ),
@@ -1492,7 +1492,8 @@ async function run() {
 
       const assigneeChanged =
         patch.assigneeId !== undefined &&
-        String(patch.assigneeId || "") !== String(existingTask.assigneeId || "");
+        String(patch.assigneeId || "") !==
+          String(existingTask.assigneeId || "");
 
       if (assigneeChanged) {
         // if current actor changed assignment, treat them as latest assigner
@@ -2116,8 +2117,8 @@ async function run() {
           .map((id) => toId(id));
         const projects = projectIds.length
           ? await projectsCollection
-            .find({ _id: { $in: projectIds } })
-            .toArray()
+              .find({ _id: { $in: projectIds } })
+              .toArray()
           : [];
         const projectNameMap = new Map(
           projects.map((p) => [String(p._id), p.name || ""]),
