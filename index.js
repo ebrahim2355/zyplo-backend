@@ -248,6 +248,34 @@ async function run() {
       return String(member?.userId || "");
     };
 
+    // ---- Status notification helpers ----
+    const normalizeStatusKey = (value) =>
+      String(value || "")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, "");
+
+    const statusLabel = (value) => {
+      const key = normalizeStatusKey(value);
+      if (key === "todo") return "To Do";
+      if (key === "inprogress") return "In Progress";
+      if (key === "inreview") return "In Review";
+      if (key === "done") return "Done";
+      return String(value || "Unknown");
+    };
+
+    const getStatusRecipients = ({ workspace, task, actorUserId }) => {
+      const assignerUserId = String(task?.assignedByUserId || "");
+      const assigneeUserId = getMemberUserId(workspace, task?.assigneeId || "");
+
+      const recipients = new Set(
+        [assignerUserId, assigneeUserId].filter(Boolean)
+      );
+
+      recipients.delete(String(actorUserId || ""));
+      return [...recipients];
+    };
+
     app.post("/auth/register", async (req, res) => {
       try {
         const { name, email, password, role } = req.body;
@@ -1283,7 +1311,7 @@ async function run() {
 
         const me = getUserIdentity(req);
         const session = client.startSession();
-        let pendingNotification = null;
+        let pendingNotification = [];
 
         try {
           let responsePayload = null;
@@ -1497,21 +1525,30 @@ async function run() {
               .sort({ order: 1, createdAt: 1 })
               .toArray();
 
-            if (nextStatus !== task.status) {
-              const assignedByUserId = String(task.assignedByUserId || "");
-              if (assignedByUserId && assignedByUserId !== String(me.id)) {
-                pendingNotification = {
-                  userId: assignedByUserId,
-                  text: `${task.assigneeName || "A member"} changed "${task.title}" status to ${nextStatus}`,
-                  type: "task_status_changed",
-                  data: {
-                    taskId: String(task._id),
-                    workspaceId: String(task.workspaceId),
-                    projectId: task.projectId ? String(task.projectId) : "",
-                    changedByUserId: String(me.id || ""),
-                  },
-                };
-              }
+            const fromStatusKey = normalizeStatusKey(task.status);
+            const toStatusKey = normalizeStatusKey(nextStatus);
+
+            if (fromStatusKey !== toStatusKey) {
+              const recipients = getStatusRecipients({
+                workspace,
+                task,
+                actorUserId: me.id,
+              });
+
+              pendingNotification = recipients.map((userId) => ({
+                userId,
+                text: `${me.name || "Someone"} changed "${task.title}" status: ${statusLabel(task.status)} -> ${statusLabel(nextStatus)}`,
+                type: "task_status_changed",
+                data: {
+                  taskId: String(task._id),
+                  workspaceId: String(task.workspaceId),
+                  projectId: task.projectId ? String(task.projectId) : "",
+                  fromStatus: fromStatusKey,
+                  toStatus: toStatusKey,
+                  changedByUserId: String(me.id || ""),
+                  changedByName: String(me.name || "User"),
+                },
+              }));
             }
 
             responsePayload = {
@@ -1561,8 +1598,8 @@ async function run() {
             };
           });
 
-          if (pendingNotification) {
-            await createNotification(pendingNotification);
+          for (const n of pendingNotification) {
+            await createNotification(n);
           }
 
           return res.json(responsePayload);
@@ -1678,30 +1715,40 @@ async function run() {
       // FIX MONGODB V6 RETURN DOCUMENT ISSUE
       const t = result?.value || result;
 
+      const fromStatusKey = normalizeStatusKey(existingTask.status);
+      const toStatusKey = normalizeStatusKey(t.status);
+
+      if (fromStatusKey !== toStatusKey) {
+        const recipients = getStatusRecipients({
+          workspace,
+          task: t,
+          actorUserId: me.id,
+        });
+
+        for (const userId of recipients) {
+          await createNotification({
+            userId,
+            text: `${me.name || "Someone"} changed "${t.title}" status: ${statusLabel(existingTask.status)} -> ${statusLabel(t.status)}`,
+            type: "task_status_changed",
+            data: {
+              taskId: String(t._id),
+              workspaceId: String(t.workspaceId),
+              projectId: t.projectId ? String(t.projectId) : "",
+              fromStatus: fromStatusKey,
+              toStatus: toStatusKey,
+              changedByUserId: String(me.id || ""),
+              changedByName: String(me.name || "User"),
+            },
+          });
+        }
+      }
+
       if (!t || !t._id)
         return res.status(404).json({ error: "Task not found" });
 
       const changed = [];
       if (patch.status && patch.status !== existingTask.status)
         changed.push(`status -> ${patch.status}`);
-
-      // notify assigner when status changes
-      if (patch.status && patch.status !== existingTask.status) {
-        const assignerUserId = String(existingTask.assignedByUserId || "");
-
-        if (assignerUserId && assignerUserId !== String(me.id)) {
-          await createNotification({
-            userId: assignerUserId,
-            text: `${t.assigneeName || "A member"} changed "${existingTask.title}" status to ${patch.status}`,
-            type: "task_status_changed",
-            data: {
-              taskId: String(taskId),
-              workspaceId: String(existingTask.workspaceId),
-              changedByUserId: String(me.id || ""),
-            },
-          });
-        }
-      }
 
       if (patch.dueDate !== undefined && patch.dueDate !== existingTask.dueDate)
         changed.push("due date");
