@@ -2712,14 +2712,9 @@ app.get("/", (req, res) => {
   res.send("Zyplo server is running!");
 });
 
-// app.listen(port, () => {
-//   console.log(`Zyplo is listening on port ${port}`);
-// });
-
-// Catch unknown routes
-app.all("*", (req, res) => {
-  res.status(404).json({ message: "Route not found" });
+app.listen(port, () => {
+  console.log(`Zyplo is listening on port ${port}`);
 });
 
-const serverless = require("serverless-http");
-module.exports = serverless(app);
+// const serverless = require("serverless-http");
+// module.exports = serverless(app);
