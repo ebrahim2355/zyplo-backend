@@ -64,6 +64,7 @@ async function run() {
     const tasksCollection = db.collection("tasks");
     const notificationsCollection = db.collection("notifications");
     const inviteCollection = db.collection("invites");
+    const commentsCollection = db.collection("comments");
 
     // register api
     const bcrypt = require("bcryptjs");
@@ -1750,6 +1751,76 @@ async function run() {
         }
       },
     );
+
+
+
+   
+   
+  // POST /api/comments- Lipi Start-----------------------------------------------------------
+  
+  app.get("/dashboard/tasks/:id", async (req, res) => {
+  const { id } = req.params;
+
+  const result = await tasksCollection.findOne({
+    _id: new ObjectId(id)
+  });
+
+  res.json({
+    result
+  });
+  });
+    
+    
+     
+  // POST ROUTE: Add a comment to a specific task
+  app.post("/dashboard/:id/comments", async (req, res) => {
+  try {
+    const { id } = req.params; 
+    const { text, author } = req.body; 
+
+    const commentData = {
+      taskId: id,
+      text: text,
+      author: author || "Anonymous", 
+      createdAt: new Date().toISOString(),
+    };
+
+    const result = await commentsCollection.insertOne(commentData);
+
+    res.json({
+      ok: true,
+      data: { 
+        ...commentData, 
+        id: result.insertedId 
+      }
+    });
+  } catch (err) {
+    console.error("POST Comment Error:", err);
+    res.status(500).json({ error: "Failed to post comment" });
+  }
+});
+
+    
+    
+// GET ROUTE: Fetch all comments for a specific task
+app.get('/dashboard/comments/:taskId', async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    
+    const comments = await commentsCollection
+      .find({ taskId: taskId })
+      .sort({ createdAt: -1 }) // Newest first
+      .toArray();
+
+    return res.json(comments);
+  } catch (err) {
+    console.error("GET Comments Error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+    // ------------------------------Lipi end--------------------------------------------
+    
+
 
     // Invite Feature--------->Rifat_END
 
