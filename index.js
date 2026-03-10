@@ -2738,5 +2738,10 @@ app.get("/", (req, res) => {
 //   console.log(`Zyplo is listening on port ${port}`);
 // });
 
+// Catch unknown routes
+app.all("*", (req, res) => {
+  res.status(404).json({ message: "Route not found" });
+});
+
 const serverless = require("serverless-http");
 module.exports = serverless(app);
