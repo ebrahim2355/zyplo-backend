@@ -66,9 +66,12 @@ async function run() {
     const notificationsCollection = db.collection("notifications");
     const inviteCollection = db.collection("invites");
     const commentsCollection = db.collection("comments");
+    const activitiesCollection = db.collection("activities");
 
     await notificationsCollection.createIndex({ userId: 1, createdAt: -1 });
     await notificationsCollection.createIndex({ userId: 1, read: 1 });
+    await activitiesCollection.createIndex({ userId: 1, createdAt: -1 });
+    await activitiesCollection.createIndex({ workspaceId: 1, createdAt: -1 });
 
     await timeLogsCollection.createIndex({ taskId: 1 });
     await timeLogsCollection.createIndex({ userId: 1 });
@@ -129,6 +132,31 @@ async function run() {
       name: req.user?.name || req.headers["x-user-name"] || "User",
     });
 
+    const findAuthUserDoc = async (me) => {
+      if (me?.id && isValidId(me.id)) {
+        const byId = await usersCollection.findOne({ _id: toId(me.id) });
+        if (byId) return byId;
+      }
+
+      const email = normalizeEmail(me?.email);
+      if (!email) return null;
+
+      return usersCollection.findOne({ email });
+    };
+
+    const mapUserProfile = (u) => ({
+      id: String(u?._id || ""),
+      email: u?.email || "",
+      name: u?.name || "",
+      phone: u?.phone || "",
+      roleTitle: u?.roleTitle || "",
+      company: u?.company || "",
+      location: u?.location || "",
+      website: u?.website || "",
+      avatarUrl: u?.avatarUrl || "",
+      bio: u?.bio || "",
+    });
+
     const isWorkspaceMember = (workspace, me) => {
       const myEmail = normalizeEmail(me?.email);
       return (workspace?.members || []).some(
@@ -164,16 +192,51 @@ async function run() {
     }) => {
       if (!userId || !text) return;
       try {
-        await notificationsCollection.insertOne({
-          userId: String(userId),
-          text: String(text),
-          type,
-          data,
-          read: false,
+        await notificationsCollection.updateOne(
+          {
+            userId: String(userId),
+            text: String(text),
+            read: false,
+          },
+          {
+            $setOnInsert: {
+              userId: String(userId),
+              text: String(text),
+              type,
+              data,
+              read: false,
+              createdAt: now(),
+            },
+          },
+          { upsert: true }
+        );
+      } catch (e) {
+        console.error("Notification insert failed:", e?.message || e);
+      }
+    };
+
+    const createActivity = async ({
+      userId = "",
+      workspaceId = "",
+      projectId = "",
+      taskId = "",
+      action = "",
+      text = "",
+      meta = {},
+    }) => {
+      try {
+        await activitiesCollection.insertOne({
+          userId: String(userId || ""),
+          workspaceId: String(workspaceId || ""),
+          projectId: String(projectId || ""),
+          taskId: String(taskId || ""),
+          action,
+          text,
+          meta,
           createdAt: now(),
         });
       } catch (e) {
-        console.error("Notification insert failed:", e?.message || e);
+        console.error("Activity insert failed:", e?.message || e);
       }
     };
 
@@ -183,6 +246,34 @@ async function run() {
     const getMemberUserId = (workspace, memberId) => {
       const member = getWorkspaceMemberById(workspace, memberId);
       return String(member?.userId || "");
+    };
+
+    // ---- Status notification helpers ----
+    const normalizeStatusKey = (value) =>
+      String(value || "")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, "");
+
+    const statusLabel = (value) => {
+      const key = normalizeStatusKey(value);
+      if (key === "todo") return "To Do";
+      if (key === "inprogress") return "In Progress";
+      if (key === "inreview") return "In Review";
+      if (key === "done") return "Done";
+      return String(value || "Unknown");
+    };
+
+    const getStatusRecipients = ({ workspace, task, actorUserId }) => {
+      const assignerUserId = String(task?.assignedByUserId || "");
+      const assigneeUserId = getMemberUserId(workspace, task?.assigneeId || "");
+
+      const recipients = new Set(
+        [assignerUserId, assigneeUserId].filter(Boolean)
+      );
+
+      recipients.delete(String(actorUserId || ""));
+      return [...recipients];
     };
 
     app.post("/auth/register", async (req, res) => {
@@ -317,12 +408,67 @@ async function run() {
 
     // users api
 
-    app.get("/users", async (req, res) => {});
+    app.get("/users", async (req, res) => { });
 
     app.post("/users", async (req, res) => {
       const users = req.body;
       const result = await usersCollection.insertOne(users);
       res.send(result);
+    });
+
+    // GET /dashboard/profile
+    app.get("/dashboard/profile", verifyToken, async (req, res) => {
+      const me = getUserIdentity(req);
+
+      const userDoc = await findAuthUserDoc(me);
+
+      if (!userDoc) {
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      return res.json({
+        currentUser: mapUserProfile(userDoc),
+      });
+    });
+
+    // PATCH /dashboard/profile
+    app.patch("/dashboard/profile", verifyToken, async (req, res) => {
+      const me = getUserIdentity(req);
+
+      const userDoc = await findAuthUserDoc(me);
+
+      if (!userDoc) {
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      const patch = req.body || {};
+      const $set = { updatedAt: now() };
+
+      for (const key of [
+        "name",
+        "phone",
+        "roleTitle",
+        "company",
+        "location",
+        "website",
+        "avatarUrl",
+        "bio",
+      ]) {
+        if (patch[key] !== undefined) {
+          $set[key] = String(patch[key] || "").trim();
+        }
+      }
+
+      await usersCollection.updateOne(
+        { _id: userDoc._id },
+        { $set }
+      );
+
+      const updated = await usersCollection.findOne({ _id: userDoc._id });
+
+      return res.json({
+        currentUser: mapUserProfile(updated),
+      });
     });
 
     // GET /dashboard/bootstrap
@@ -331,7 +477,12 @@ async function run() {
       if (!me.id) return res.status(401).json({ error: "Unauthorized" });
 
       const workspaceDocs = await workspacesCollection
-        .find({ "members.userId": String(me.id) })
+        .find({
+          $or: [
+            { "members.userId": String(me.id) },
+            { "members.email": normalizeEmail(me.email) },
+          ],
+        })
         .sort({ createdAt: -1 })
         .toArray();
 
@@ -356,8 +507,18 @@ async function run() {
         members: w.members || [],
       }));
 
+      const userDoc = await findAuthUserDoc(me);
+
+      const activity = await activitiesCollection
+        .find({ workspaceId: { $in: workspaceIds.map(String) } })
+        .sort({ createdAt: -1 })
+        .limit(100)
+        .toArray();
+
       res.json({
-        currentUser: { id: String(me.id), name: me.name, email: me.email },
+        currentUser: userDoc
+          ? mapUserProfile(userDoc)
+          : { id: String(me.id || ""), name: me.name || "", email: me.email || "" },
         workspaces,
         projects: projects.map((p) => ({
           id: String(p._id),
@@ -398,7 +559,14 @@ async function run() {
           attachments: t.attachments || [],
           // bayijid - file attach
         })),
-        activity: [],
+        activity: activity.map((a) => ({
+          id: String(a._id),
+          text: a.text,
+          action: a.action,
+          createdAt: a.createdAt,
+          taskId: a.taskId,
+          projectId: a.projectId,
+        })),
         notifications: notifications.map((n) => ({
           id: String(n._id),
           text: n.text,
@@ -872,6 +1040,15 @@ async function run() {
 
       const result = await tasksCollection.insertOne(task);
 
+      await createActivity({
+        userId: me.id,
+        workspaceId,
+        projectId,
+        taskId: String(result.insertedId),
+        action: "task_created",
+        text: `${me.name} created task "${task.title}"`,
+      });
+
       const assigneeUserId = getMemberUserId(workspace, task.assigneeId);
       if (assigneeUserId && assigneeUserId !== String(me.id)) {
         await createNotification({
@@ -991,6 +1168,15 @@ async function run() {
         });
       }
 
+      await createActivity({
+        userId: me.id,
+        workspaceId: String(task.workspaceId),
+        projectId: task.projectId ? String(task.projectId) : "",
+        taskId: String(task._id),
+        action: "task_deleted",
+        text: `${me.name} deleted task "${task.title}"`,
+      });
+
       await tasksCollection.deleteOne({ _id: toId(taskId) });
       await timeLogsCollection.deleteMany({ taskId: toId(taskId) });
       return res.json({ ok: true });
@@ -1061,7 +1247,7 @@ async function run() {
                 t.remainingTime !== undefined
                   ? t.remainingTime
                   : Number(t.estimatedTime || 0) -
-                      Number(t.totalTimeSpent || 0),
+                  Number(t.totalTimeSpent || 0),
               ),
               0,
             ),
@@ -1125,7 +1311,7 @@ async function run() {
 
         const me = getUserIdentity(req);
         const session = client.startSession();
-        let pendingNotification = null;
+        let pendingNotification = [];
 
         try {
           let responsePayload = null;
@@ -1193,13 +1379,13 @@ async function run() {
               String(targetBoardId) === String(sourceBoard._id)
                 ? sourceBoard
                 : await boardsCollection.findOne(
-                    {
-                      _id: targetBoardId,
-                      workspaceId: toId(task.workspaceId),
-                      projectId: toId(task.projectId),
-                    },
-                    { session },
-                  );
+                  {
+                    _id: targetBoardId,
+                    workspaceId: toId(task.workspaceId),
+                    projectId: toId(task.projectId),
+                  },
+                  { session },
+                );
             if (!destinationBoard) {
               throw { status: 404, message: "Destination board not found" };
             }
@@ -1339,21 +1525,30 @@ async function run() {
               .sort({ order: 1, createdAt: 1 })
               .toArray();
 
-            if (nextStatus !== task.status) {
-              const assignedByUserId = String(task.assignedByUserId || "");
-              if (assignedByUserId && assignedByUserId !== String(me.id)) {
-                pendingNotification = {
-                  userId: assignedByUserId,
-                  text: `${task.assigneeName || "A member"} changed "${task.title}" status to ${nextStatus}`,
-                  type: "task_status_changed",
-                  data: {
-                    taskId: String(task._id),
-                    workspaceId: String(task.workspaceId),
-                    projectId: task.projectId ? String(task.projectId) : "",
-                    changedByUserId: String(me.id || ""),
-                  },
-                };
-              }
+            const fromStatusKey = normalizeStatusKey(task.status);
+            const toStatusKey = normalizeStatusKey(nextStatus);
+
+            if (fromStatusKey !== toStatusKey) {
+              const recipients = getStatusRecipients({
+                workspace,
+                task,
+                actorUserId: me.id,
+              });
+
+              pendingNotification = recipients.map((userId) => ({
+                userId,
+                text: `${me.name || "Someone"} changed "${task.title}" status: ${statusLabel(task.status)} -> ${statusLabel(nextStatus)}`,
+                type: "task_status_changed",
+                data: {
+                  taskId: String(task._id),
+                  workspaceId: String(task.workspaceId),
+                  projectId: task.projectId ? String(task.projectId) : "",
+                  fromStatus: fromStatusKey,
+                  toStatus: toStatusKey,
+                  changedByUserId: String(me.id || ""),
+                  changedByName: String(me.name || "User"),
+                },
+              }));
             }
 
             responsePayload = {
@@ -1391,7 +1586,7 @@ async function run() {
                         t.remainingTime !== undefined
                           ? t.remainingTime
                           : Number(t.estimatedTime || 0) -
-                              Number(t.totalTimeSpent || 0),
+                          Number(t.totalTimeSpent || 0),
                       ),
                       0,
                     ),
@@ -1403,8 +1598,8 @@ async function run() {
             };
           });
 
-          if (pendingNotification) {
-            await createNotification(pendingNotification);
+          for (const n of pendingNotification) {
+            await createNotification(n);
           }
 
           return res.json(responsePayload);
@@ -1494,7 +1689,7 @@ async function run() {
       const assigneeChanged =
         patch.assigneeId !== undefined &&
         String(patch.assigneeId || "") !==
-          String(existingTask.assigneeId || "");
+        String(existingTask.assigneeId || "");
 
       if (assigneeChanged) {
         // if current actor changed assignment, treat them as latest assigner
@@ -1508,8 +1703,45 @@ async function run() {
         { returnDocument: "after" },
       );
 
+      await createActivity({
+        userId: me.id,
+        workspaceId: String(existingTask.workspaceId),
+        projectId: existingTask.projectId ? String(existingTask.projectId) : "",
+        taskId: String(taskId),
+        action: "task_updated",
+        text: `${me.name} updated task "${existingTask.title}"`,
+      });
+
       // FIX MONGODB V6 RETURN DOCUMENT ISSUE
       const t = result?.value || result;
+
+      const fromStatusKey = normalizeStatusKey(existingTask.status);
+      const toStatusKey = normalizeStatusKey(t.status);
+
+      if (fromStatusKey !== toStatusKey) {
+        const recipients = getStatusRecipients({
+          workspace,
+          task: t,
+          actorUserId: me.id,
+        });
+
+        for (const userId of recipients) {
+          await createNotification({
+            userId,
+            text: `${me.name || "Someone"} changed "${t.title}" status: ${statusLabel(existingTask.status)} -> ${statusLabel(t.status)}`,
+            type: "task_status_changed",
+            data: {
+              taskId: String(t._id),
+              workspaceId: String(t.workspaceId),
+              projectId: t.projectId ? String(t.projectId) : "",
+              fromStatus: fromStatusKey,
+              toStatus: toStatusKey,
+              changedByUserId: String(me.id || ""),
+              changedByName: String(me.name || "User"),
+            },
+          });
+        }
+      }
 
       if (!t || !t._id)
         return res.status(404).json({ error: "Task not found" });
@@ -1517,6 +1749,7 @@ async function run() {
       const changed = [];
       if (patch.status && patch.status !== existingTask.status)
         changed.push(`status -> ${patch.status}`);
+
       if (patch.dueDate !== undefined && patch.dueDate !== existingTask.dueDate)
         changed.push("due date");
       if (patch.title && patch.title !== existingTask.title)
@@ -2118,8 +2351,8 @@ async function run() {
           .map((id) => toId(id));
         const projects = projectIds.length
           ? await projectsCollection
-              .find({ _id: { $in: projectIds } })
-              .toArray()
+            .find({ _id: { $in: projectIds } })
+            .toArray()
           : [];
         const projectNameMap = new Map(
           projects.map((p) => [String(p._id), p.name || ""]),
@@ -2719,72 +2952,72 @@ async function run() {
 
 
 
-   
-   
-  // POST /api/comments- Lipi Start-----------------------------------------------------------
-  
-  app.get("/dashboard/tasks/:id", async (req, res) => {
-  const { id } = req.params;
 
-  const result = await tasksCollection.findOne({
-    _id: new ObjectId(id)
-  });
 
-  res.json({
-    result
-  });
-  });
-    
-    
-     
-  // POST ROUTE: Add a comment to a specific task
-  app.post("/dashboard/:id/comments", async (req, res) => {
-  try {
-    const { id } = req.params; 
-    const { text, author } = req.body; 
+    // POST /api/comments- Lipi Start-----------------------------------------------------------
 
-    const commentData = {
-      taskId: id,
-      text: text,
-      author: author || "Anonymous", 
-      createdAt: new Date().toISOString(),
-    };
+    app.get("/dashboard/tasks/:id", async (req, res) => {
+      const { id } = req.params;
 
-    const result = await commentsCollection.insertOne(commentData);
+      const result = await tasksCollection.findOne({
+        _id: new ObjectId(id)
+      });
 
-    res.json({
-      ok: true,
-      data: { 
-        ...commentData, 
-        id: result.insertedId 
+      res.json({
+        result
+      });
+    });
+
+
+
+    // POST ROUTE: Add a comment to a specific task
+    app.post("/dashboard/:id/comments", async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { text, author } = req.body;
+
+        const commentData = {
+          taskId: id,
+          text: text,
+          author: author || "Anonymous",
+          createdAt: new Date().toISOString(),
+        };
+
+        const result = await commentsCollection.insertOne(commentData);
+
+        res.json({
+          ok: true,
+          data: {
+            ...commentData,
+            id: result.insertedId
+          }
+        });
+      } catch (err) {
+        console.error("POST Comment Error:", err);
+        res.status(500).json({ error: "Failed to post comment" });
       }
     });
-  } catch (err) {
-    console.error("POST Comment Error:", err);
-    res.status(500).json({ error: "Failed to post comment" });
-  }
-});
 
-    
-    
-// GET ROUTE: Fetch all comments for a specific task
-app.get('/dashboard/comments/:taskId', async (req, res) => {
-  try {
-    const { taskId } = req.params;
-    
-    const comments = await commentsCollection
-      .find({ taskId: taskId })
-      .sort({ createdAt: -1 }) // Newest first
-      .toArray();
 
-    return res.json(comments);
-  } catch (err) {
-    console.error("GET Comments Error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
+
+    // GET ROUTE: Fetch all comments for a specific task
+    app.get('/dashboard/comments/:taskId', async (req, res) => {
+      try {
+        const { taskId } = req.params;
+
+        const comments = await commentsCollection
+          .find({ taskId: taskId })
+          .sort({ createdAt: -1 }) // Newest first
+          .toArray();
+
+        return res.json(comments);
+      } catch (err) {
+        console.error("GET Comments Error:", err);
+        res.status(500).json({ error: "Server error" });
+      }
+    });
     // ------------------------------Lipi end--------------------------------------------
-    
+
 
 
     // Invite Feature--------->Rifat_END
