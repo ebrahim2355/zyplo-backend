@@ -2734,12 +2734,9 @@ app.get("/", (req, res) => {
   res.send("Zyplo server is running!");
 });
 
-app.listen(port, () => {
-  console.log(`Zyplo is listening on port ${port}`);
-});
+// app.listen(port, () => {
+//   console.log(`Zyplo is listening on port ${port}`);
+// });
 
-// EXPORT FOR VERCEL SERVERLESS
-module.exports = app;
-
-// const serverless = require("serverless-http");
-// module.exports = serverless(app);
+const serverless = require("serverless-http");
+module.exports = serverless(app);
