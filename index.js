@@ -601,6 +601,7 @@ async function run() {
     const LOCK_TIME = 30 * 1000;
 
     app.post("/auth/login", async (req, res) => {
+      console.log("POST /auth/login hit", req.body);
       try {
         const { email, password } = req.body;
 
@@ -663,8 +664,6 @@ async function run() {
     });
 
     // users api
-
-    app.get("/users", async (req, res) => {});
 
     app.post("/users", async (req, res) => {
       const users = req.body;
