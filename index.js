@@ -3456,9 +3456,16 @@ app.get("/", (req, res) => {
   res.send("Zyplo server is running!");
 });
 
-app.listen(port, () => {
-  console.log(`Zyplo is listening on port ${port}`);
-});
+// app.listen(port, () => {
+//   console.log(`Zyplo is listening on port ${port}`);
+// });
 
+if (process.env.NODE_ENV !== "production") {
+  app.listen(port, () => {
+    console.log(`Zyplo is listening on port ${port}`);
+  });
+}
+
+module.exports = app;
 // const serverless = require("serverless-http");
 // module.exports = serverless(app);
