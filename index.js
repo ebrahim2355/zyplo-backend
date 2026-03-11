@@ -1253,6 +1253,10 @@ const taskRef = `${project.key}-${nextTaskNumber}`;
           projectId: String(task.projectId),
           boardId: String(task.boardId),
           columnId: String(task.columnId),
+          // Keep taskRef/taskNumber in the response so the frontend can render
+          // it immediately (and not "lose" it during store merges).
+          taskNumber: task.taskNumber || "",
+          taskRef: task.taskRef || "",
           order: task.order,
           projectName: task.projectName,
           title: task.title,
@@ -1753,6 +1757,10 @@ const taskRef = `${project.key}-${nextTaskNumber}`;
                     projectId: t.projectId ? String(t.projectId) : "",
                     boardId: t.boardId ? String(t.boardId) : "",
                     columnId: t.columnId ? String(t.columnId) : "",
+                    // Keep taskRef/taskNumber in move response so UI state
+                    // doesn't drop it after drag/drop operations.
+                    taskNumber: t.taskNumber || "",
+                    taskRef: t.taskRef || "",
                     order: Number(t.order || 0),
                     projectName: t.projectName || "",
                     title: t.title,
@@ -3167,30 +3175,6 @@ app.get("/dashboard/tasks/:taskId/activities", async (req, res) => {
     .toArray();
   return res.json(activities);
 });
-
-
-app.get("/debug/activities", async (req, res) => {
-  const activities = await activitiesCollection
-    .find({ action: { $regex: "^github_" } })
-    .sort({ createdAt: -1 })
-    .limit(10)
-    .toArray();
-  res.json(activities);
-});
-
-
-app.get("/debug/tasks", async (req, res) => {
-  const tasks = await tasksCollection
-    .find({})
-    .project({ title: 1, taskRef: 1, taskNumber: 1, status: 1 })
-    .sort({ createdAt: -1 })
-    .limit(5)
-    .toArray();
-  res.json(tasks);
-});
-
-
-
 
     // Github WebHook ----------> Rifat End
 
