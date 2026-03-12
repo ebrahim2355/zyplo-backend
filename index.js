@@ -10,7 +10,7 @@ const crypto = require("crypto");
 const nodemailer = require("nodemailer");
 const port = process.env.PORT || 5000;
 
-setServers(["1.1.1.1", "8.8.8.8"]);
+// setServers(["1.1.1.1", "8.8.8.8"]);
 
 // Capture raw body bytes for GitHub webhook signature verification while still
 // parsing JSON for the rest of the app.
