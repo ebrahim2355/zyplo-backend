@@ -1,5 +1,6 @@
 const { setServers } = require("node:dns/promises");
 const express = require("express");
+const serverless = require("serverless-http");
 const cors = require("cors");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const app = express();
@@ -10,7 +11,7 @@ const crypto = require("crypto");
 const nodemailer = require("nodemailer");
 const port = process.env.PORT || 5000;
 
-// setServers(["1.1.1.1", "8.8.8.8"]);
+setServers(["1.1.1.1", "8.8.8.8"]);
 
 // Capture raw body bytes for GitHub webhook signature verification while still
 // parsing JSON for the rest of the app.
@@ -3456,9 +3457,9 @@ app.get("/", (req, res) => {
   res.send("Zyplo server is running!");
 });
 
-app.listen(port, () => {
-  console.log(`Zyplo is listening on port ${port}`);
-});
+// app.listen(port, () => {
+//   console.log(`Zyplo is listening on port ${port}`);
+// });
 
 // if (process.env.NODE_ENV !== "production") {
 //   app.listen(port, () => {
@@ -3467,5 +3468,4 @@ app.listen(port, () => {
 // }
 
 // module.exports = app;
-// const serverless = require("serverless-http");
-// module.exports = serverless(app);
+module.exports = serverless(app);
