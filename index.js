@@ -1,7 +1,7 @@
+const { setServers } = require("node:dns/promises");
 const cors = require("cors");
 const express = require("express");
 const app = express();
-const serverless = require("serverless-http");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 require("dotenv").config();
 const jwt = require("jsonwebtoken");
@@ -9,6 +9,8 @@ const { z } = require("zod");
 const crypto = require("crypto");
 const nodemailer = require("nodemailer");
 const port = process.env.PORT || 5000;
+
+// setServers(["1.1.1.1", "8.8.8.8"]);
 
 // Capture raw body bytes for GitHub webhook signature verification while still
 // parsing JSON for the rest of the app.
@@ -38,77 +40,6 @@ const client = new MongoClient(uri, {
   },
 });
 
-// --- Lazy DB connection for Vercel serverless ---
-// Collections are set once on first connect and reused across warm invocations.
-let dbReady = false;
-let usersCollection,
-  workspacesCollection,
-  projectsCollection,
-  boardsCollection,
-  tasksCollection,
-  timeLogsCollection,
-  notificationsCollection,
-  inviteCollection,
-  commentsCollection,
-  activitiesCollection,
-  githubInstallationsCollection;
-
-async function connectDB() {
-  if (dbReady) return;
-  await client.connect();
-  const db = client.db("zyplo-db");
-  usersCollection = db.collection("users");
-  workspacesCollection = db.collection("workspaces");
-  projectsCollection = db.collection("projects");
-  boardsCollection = db.collection("boards");
-  tasksCollection = db.collection("tasks");
-  timeLogsCollection = db.collection("timeLogs");
-  notificationsCollection = db.collection("notifications");
-  inviteCollection = db.collection("invites");
-  commentsCollection = db.collection("comments");
-  activitiesCollection = db.collection("activities");
-  githubInstallationsCollection = db.collection("githubInstallations");
-
-  // Create indexes once — wrapped so duplicate-index errors are silently skipped
-  await Promise.all([
-    notificationsCollection.createIndex({ userId: 1, createdAt: -1 }),
-    notificationsCollection.createIndex({ userId: 1, read: 1 }),
-    activitiesCollection.createIndex({ userId: 1, createdAt: -1 }),
-    activitiesCollection.createIndex({ workspaceId: 1, createdAt: -1 }),
-    tasksCollection.createIndex({ taskRef: 1 }, { unique: true, sparse: true }),
-    timeLogsCollection.createIndex({ taskId: 1 }),
-    timeLogsCollection.createIndex({ userId: 1 }),
-    timeLogsCollection.createIndex({ projectId: 1 }),
-    timeLogsCollection.createIndex({ workspaceId: 1 }),
-    timeLogsCollection.createIndex({ startTime: 1 }),
-  ]);
-
-  try {
-    await timeLogsCollection.createIndex(
-      { userId: 1, endTime: 1 },
-      { unique: true, partialFilterExpression: { endTime: null } },
-    );
-  } catch (e) {
-    const msg = String(e?.message || "");
-    if (!msg.includes("Index already exists with a different name")) {
-      console.error("Time log unique index skipped:", e?.message || e);
-    }
-  }
-
-  dbReady = true;
-}
-
-// Middleware: ensure DB is connected before every request
-app.use(async (req, res, next) => {
-  try {
-    await connectDB();
-    next();
-  } catch (err) {
-    console.error("DB connection error:", err);
-    res.status(500).json({ message: "Database connection failed" });
-  }
-});
-
 const verifyToken = (req, res, next) => {
   const token = req.headers.authorization?.split(" ")[1];
 
@@ -130,8 +61,55 @@ const inviteSchema = z.object({
   role: z.enum(["admin", "member"]),
 });
 
-// register api
-const bcrypt = require("bcryptjs");
+async function run() {
+  try {
+    // Connect the client to the server (optional starting in v4.7)
+    // await client.connect();
+
+    const db = client.db("zyplo-db");
+    const usersCollection = db.collection("users");
+    //added for workspace
+    const workspacesCollection = db.collection("workspaces");
+    const projectsCollection = db.collection("projects");
+    const boardsCollection = db.collection("boards");
+    const tasksCollection = db.collection("tasks");
+    const timeLogsCollection = db.collection("timeLogs");
+    const notificationsCollection = db.collection("notifications");
+    const inviteCollection = db.collection("invites");
+    const commentsCollection = db.collection("comments");
+    const activitiesCollection = db.collection("activities");
+    const githubInstallationsCollection = db.collection("githubInstallations");
+
+    await notificationsCollection.createIndex({ userId: 1, createdAt: -1 });
+    await notificationsCollection.createIndex({ userId: 1, read: 1 });
+    await activitiesCollection.createIndex({ userId: 1, createdAt: -1 });
+    await activitiesCollection.createIndex({ workspaceId: 1, createdAt: -1 });
+    await tasksCollection.createIndex(
+      { taskRef: 1 },
+      { unique: true, sparse: true },
+    );
+    await timeLogsCollection.createIndex({ taskId: 1 });
+    await timeLogsCollection.createIndex({ userId: 1 });
+    await timeLogsCollection.createIndex({ projectId: 1 });
+    await timeLogsCollection.createIndex({ workspaceId: 1 });
+    await timeLogsCollection.createIndex({ startTime: 1 });
+    try {
+      await timeLogsCollection.createIndex(
+        { userId: 1, endTime: 1 },
+        {
+          unique: true,
+          partialFilterExpression: { endTime: null },
+        },
+      );
+    } catch (e) {
+      const msg = String(e?.message || "");
+      if (!msg.includes("Index already exists with a different name")) {
+        console.error("Time log unique index skipped:", e?.message || e);
+      }
+    }
+
+    // register api
+    const bcrypt = require("bcryptjs");
 
     // New variables
     const toId = (v) => new ObjectId(String(v));
@@ -3463,19 +3441,32 @@ const bcrypt = require("bcryptjs");
     });
     // ------------------------------Lipi end--------------------------------------------
 
+    // Send a ping to confirm a successful connection
+    // await client.db("admin").command({ ping: 1 });
+    // console.log(
+    //   "Pinged your deployment. You successfully connected to MongoDB!",
+    // );
+  } finally {
+    // Ensures that the client will close when you finish/error
+    // await client.close();
+  }
+}
+run().catch(console.dir);
+
 app.get("/", (req, res) => {
   res.send("Zyplo server is running!");
 });
 
-// app.listen(port, () => {
-//   console.log(`Zyplo is listening on port ${port}`);
-// });
+app.listen(port, () => {
+  console.log(`Zyplo is listening on port ${port}`);
+});
 
-// if (process.env.NODE_ENV !== "production") {
-//   app.listen(port, () => {
-//     console.log(`Zyplo is listening on port ${port}`);
-//   });
-// }
+if (process.env.NODE_ENV !== "production") {
+  app.listen(port, () => {
+    console.log(`Zyplo is listening on port ${port}`);
+  });
+}
 
 // module.exports = app;
-module.exports = serverless(app);
+// const serverless = require("serverless-http");
+// module.exports = serverless(app);
