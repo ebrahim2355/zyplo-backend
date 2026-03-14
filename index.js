@@ -10,7 +10,7 @@ const crypto = require("crypto");
 const nodemailer = require("nodemailer");
 const port = process.env.PORT || 5000;
 
-// setServers(["1.1.1.1", "8.8.8.8"]);
+setServers(["1.1.1.1", "8.8.8.8"]);
 
 // Capture raw body bytes for GitHub webhook signature verification while still
 // parsing JSON for the rest of the app.
@@ -602,7 +602,7 @@ async function run() {
     const LOCK_TIME = 30 * 1000;
 
     app.post("/auth/login", async (req, res) => {
-      console.log("POST /auth/login hit", req.body);
+      // console.log("POST /auth/login hit", req.body);
       try {
         const { email, password } = req.body;
 
@@ -3461,11 +3461,11 @@ app.listen(port, () => {
   console.log(`Zyplo is listening on port ${port}`);
 });
 
-if (process.env.NODE_ENV !== "production") {
-  app.listen(port, () => {
-    console.log(`Zyplo is listening on port ${port}`);
-  });
-}
+// if (process.env.NODE_ENV !== "production") {
+//   app.listen(port, () => {
+//     console.log(`Zyplo is listening on port ${port}`);
+//   });
+// }
 
 // module.exports = app;
 // const serverless = require("serverless-http");
