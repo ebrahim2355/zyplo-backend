@@ -1,5 +1,6 @@
 const { setServers } = require("node:dns/promises");
 const express = require("express");
+const serverless = require("serverless-http");
 const cors = require("cors");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const app = express();
@@ -601,6 +602,7 @@ async function run() {
     const LOCK_TIME = 30 * 1000;
 
     app.post("/auth/login", async (req, res) => {
+      console.log("POST /auth/login hit", req.body);
       try {
         const { email, password } = req.body;
 
@@ -663,8 +665,6 @@ async function run() {
     });
 
     // users api
-
-    app.get("/users", async (req, res) => {});
 
     app.post("/users", async (req, res) => {
       const users = req.body;
@@ -3457,9 +3457,15 @@ app.get("/", (req, res) => {
   res.send("Zyplo server is running!");
 });
 
-app.listen(port, () => {
-  console.log(`Zyplo is listening on port ${port}`);
-});
+// app.listen(port, () => {
+//   console.log(`Zyplo is listening on port ${port}`);
+// });
 
-// const serverless = require("serverless-http");
-// module.exports = serverless(app);
+// if (process.env.NODE_ENV !== "production") {
+//   app.listen(port, () => {
+//     console.log(`Zyplo is listening on port ${port}`);
+//   });
+// }
+
+// module.exports = app;
+module.exports = serverless(app);
