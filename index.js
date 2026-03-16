@@ -12,8 +12,6 @@ const port = process.env.PORT || 5000;
 
 // setServers(["1.1.1.1", "8.8.8.8"]);
 
-// Capture raw body bytes for GitHub webhook signature verification while still
-// parsing JSON for the rest of the app.
 app.use(
   cors({
     origin: ["http://localhost:3000", "https://zyplo-six.vercel.app"],
@@ -21,6 +19,8 @@ app.use(
   }),
 );
 
+// Capture raw body bytes for GitHub webhook signature verification while still
+// parsing JSON for the rest of the app.
 app.use(
   express.json({
     verify: (req, _res, buf) => {
