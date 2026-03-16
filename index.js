@@ -561,6 +561,12 @@ async function run() {
       return String(member?.userId || "");
     };
 
+    const mapTaskReporter = (task) => ({
+      reporterId: String(task?.reporterId || ""),
+      reporterName: String(task?.reporterName || ""),
+      reporterEmail: String(task?.reporterEmail || ""),
+    });
+
     // ---- Status notification helpers ----
     const normalizeStatusKey = (value) =>
       String(value || "")
@@ -858,6 +864,7 @@ async function run() {
           dueDate: t.dueDate || "",
           assigneeId: t.assigneeId || "",
           assigneeName: t.assigneeName || "Unassigned",
+          ...mapTaskReporter(t),
           createdAt: t.createdAt,
           updatedAt: t.updatedAt || "",
           estimatedTime: Number(t.estimatedTime || 0),
@@ -1360,6 +1367,9 @@ async function run() {
         dueDate,
         assigneeId: assignee?.id || "",
         assigneeName: assignee?.name || "Unassigned",
+        reporterId: String(me.id || ""),
+        reporterName: String(me.name || me.email || "User"),
+        reporterEmail: String(me.email || ""),
         estimatedTime: safeEstimatedTime,
         totalTimeSpent: 0,
         remainingTime: safeEstimatedTime,
@@ -1417,6 +1427,7 @@ async function run() {
           dueDate: task.dueDate,
           assigneeId: task.assigneeId,
           assigneeName: task.assigneeName,
+          ...mapTaskReporter(task),
           estimatedTime: task.estimatedTime,
           totalTimeSpent: task.totalTimeSpent,
           remainingTime: task.remainingTime,
@@ -1578,6 +1589,7 @@ async function run() {
             dueDate: t.dueDate || "",
             assigneeId: t.assigneeId || "",
             assigneeName: t.assigneeName || "Unassigned",
+            ...mapTaskReporter(t),
             createdAt: t.createdAt,
             updatedAt: t.updatedAt || "",
             estimatedTime: Number(t.estimatedTime || 0),
@@ -1921,6 +1933,7 @@ async function run() {
                     dueDate: t.dueDate || "",
                     assigneeId: t.assigneeId || "",
                     assigneeName: t.assigneeName || "Unassigned",
+                    ...mapTaskReporter(t),
                     createdAt: t.createdAt,
                     updatedAt: t.updatedAt || "",
                     estimatedTime: Number(t.estimatedTime || 0),
@@ -2139,6 +2152,7 @@ async function run() {
           dueDate: t.dueDate || "",
           assigneeId: t.assigneeId || "",
           assigneeName: t.assigneeName || "Unassigned",
+          ...mapTaskReporter(t),
           createdAt: t.createdAt,
           updatedAt: t.updatedAt || "",
           estimatedTime: Number(t.estimatedTime || 0),
