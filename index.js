@@ -119,8 +119,8 @@ async function run() {
         .trim()
         .toLowerCase();
 
-    // --Github Integration Start--
-    const TASK_REF_PATTERN = /([A-Z]{2,6})-(\d+)/g;
+		    // --Github Integration Start--
+		    const TASK_REF_PATTERN = /([A-Z]{2,6})-(\d+)/g;
 
     // For PR titles — returns first match only e.g. "AUTH-1"
     function extractTaskRef(text) {
@@ -142,19 +142,19 @@ async function run() {
       TASK_REF_PATTERN.lastIndex = 0;
       return refs;
     }
-    // Verify Signature
-    function verifyGithubWebhookSignature(req) {
-      try {
-        const secret = process.env.GITHUB_WEBHOOK_SECRET;
-        if (!secret) return true; // skip if no secret configured
+	    // Verify Signature
+		    function verifyGithubWebhookSignature(req) {
+		      try {
+		        const secret = process.env.GITHUB_WEBHOOK_SECRET;
+		        if (!secret) return true; // skip if no secret configured
 
-        const signature = String(req.headers["x-hub-signature-256"] || "");
-        if (!signature.startsWith("sha256=")) return false;
+		        const signature = String(req.headers["x-hub-signature-256"] || "");
+		        if (!signature.startsWith("sha256=")) return false;
 
-        // IMPORTANT: GitHub signs the raw request bytes, not the parsed JSON.
-        // We capture raw bytes via express.json({ verify }) for /github/webhook.
-        const raw = Buffer.isBuffer(req.rawBody)
-          ? req.rawBody
+	        // IMPORTANT: GitHub signs the raw request bytes, not the parsed JSON.
+	        // We capture raw bytes via express.json({ verify }) for /github/webhook.
+	        const raw = Buffer.isBuffer(req.rawBody)
+	          ? req.rawBody
           : Buffer.from(JSON.stringify(req.body || {}), "utf8");
 
         const hmac = crypto.createHmac("sha256", secret);
@@ -169,46 +169,100 @@ async function run() {
         return false;
       }
     }
-    // get Workspace
-    async function getWorkspaceByInstallation(installationId) {
-      if (!installationId) return null;
-      const installation = await githubInstallationsCollection.findOne({
-        installationId: String(installationId),
-      });
-      if (!installation) return null;
-      if (!isValidId(installation.workspaceId)) return null;
-      return await workspacesCollection.findOne({
-        _id: toId(installation.workspaceId),
-      });
-    }
+		    // get Workspace
+		    async function getWorkspaceByInstallation(installationId) {
+		      if (!installationId) return null;
+		      const installation = await githubInstallationsCollection.findOne({
+		        installationId: String(installationId),
+		      });
+		      if (!installation) return null;
+		      if (!isValidId(installation.workspaceId)) return null;
+		      return await workspacesCollection.findOne({
+		        _id: toId(installation.workspaceId),
+		      });
+		    }
 
-    // PR event handler
-    async function handlePullRequestEvent(payload) {
-      const {
-        action,
-        pull_request: pullRequest,
-        repository,
-        installation,
-      } = payload;
+      // Move task helper
+     async function moveTaskToStatusColumn(task, newStatus) {
+  // Find the board for this task — columns are embedded in the board document
+  const board = await boardsCollection.findOne({ projectId: task.projectId });
+  if (!board) {
+    console.log("[Move] No board found for projectId:", task.projectId);
+    return;
+  }
 
-      const taskRef = extractTaskRef(pullRequest.title);
-      if (!taskRef) return;
+  // Columns are stored as board.columns array (embedded)
+  const columns = board.columns || [];
+  if (!columns.length) {
+    console.log("[Move] No columns found in board");
+    return;
+  }
 
-      // Find workspace from installation
-      const workspace = await getWorkspaceByInstallation(installation?.id);
-      if (!workspace) {
-        console.log(
-          `[GitHub/PR] No workspace found for installation ${installation?.id}`,
-        );
-        return;
-      }
+  function normalizeStr(name) {
+    return String(name || "").toLowerCase().replace(/[^a-z]/g, "");
+  }
 
-      // Scope task search to this workspace
-      const task = await tasksCollection.findOne({
-        taskRef: taskRef,
-        workspaceId: workspace._id,
-      });
-      if (!task) return;
+  function statusMatchesColumn(columnName, status) {
+    const col = normalizeStr(columnName);
+    const s = normalizeStr(status); // strips underscores too: "in_progress" → "inprogress"
+    if (s === "todo" && (col === "todo" || col === "backlog")) return true;
+    if (s === "inprogress" && (col === "inprogress" || col === "doing")) return true;
+    if (s === "inreview" && (col === "inreview" || col === "review")) return true;
+    if (s === "done" && (col === "done" || col === "completed")) return true;
+    return false;
+  }
+
+  const targetColumn = columns.find((col) =>
+    statusMatchesColumn(col.name, newStatus)
+  );
+
+  if (!targetColumn) {
+    console.log("[Move] No matching column for status:", newStatus, "| columns:", columns.map(c => c.name));
+    return;
+  }
+
+  // Don't move if already in the right column
+  if (String(task.columnId) === String(targetColumn._id)) {
+    console.log("[Move] Task already in correct column");
+    return;
+  }
+
+  console.log("[Move] Moving task", task.taskRef, "to column:", targetColumn.name);
+
+  // Move task to target column
+  await tasksCollection.updateOne(
+    { _id: task._id },
+    { $set: { columnId: targetColumn._id, updatedAt: now() } }
+  );
+}
+
+	    // PR event handler
+	    async function handlePullRequestEvent(payload) {
+	      const {
+	        action,
+	        pull_request: pullRequest,
+	        repository,
+	        installation,
+	      } = payload;
+
+	      const taskRef = extractTaskRef(pullRequest.title);
+	      if (!taskRef) return;
+
+	      // Find workspace from installation
+	      const workspace = await getWorkspaceByInstallation(installation?.id);
+	      if (!workspace) {
+	        console.log(
+	          `[GitHub/PR] No workspace found for installation ${installation?.id}`,
+	        );
+	        return;
+	      }
+
+	      // Scope task search to this workspace
+	      const task = await tasksCollection.findOne({
+	        taskRef: taskRef,
+	        workspaceId: workspace._id,
+	      });
+	      if (!task) return;
 
       const newStatus =
         action === "opened"
@@ -221,19 +275,21 @@ async function run() {
                 ? "todo"
                 : null;
 
-      if (newStatus) {
-        await tasksCollection.updateOne(
-          { taskRef: taskRef, workspaceId: workspace._id },
-          { $set: { status: newStatus, updatedAt: now() } },
-        );
-      }
+	      if (newStatus) {
+	        await tasksCollection.updateOne(
+	          { taskRef: taskRef, workspaceId: workspace._id },
+	          { $set: { status: newStatus, updatedAt: now() } },
+	        );
+	            await moveTaskToStatusColumn(task, newStatus);
 
-      try {
-        await activitiesCollection.insertOne({
-          userId: "",
-          workspaceId: String(workspace._id),
-          projectId: String(task.projectId || ""),
-          taskId: String(task._id),
+	      }
+
+	      try {
+	        await activitiesCollection.insertOne({
+	          userId: "",
+	          workspaceId: String(workspace._id),
+	          projectId: String(task.projectId || ""),
+	          taskId: String(task._id),
           action: `github_pr_${action}`,
           text: `PR #${pullRequest.number} "${pullRequest.title}" ${action} by @${pullRequest.user.login}`,
           meta: {
@@ -243,60 +299,60 @@ async function run() {
             repositoryName: repository.full_name,
             githubUsername: pullRequest.user.login,
             githubAvatarUrl: pullRequest.user.avatar_url,
-          },
-          createdAt: now(),
-        });
-      } catch (err) {
-        console.error("[GitHub/PR] Activity insert failed:", err.message);
-      }
+	          },
+	          createdAt: now(),
+	        });
+	      } catch (err) {
+	        console.error("[GitHub/PR] Activity insert failed:", err.message);
+	      }
 
-      const assigneeUserId = getMemberUserId(workspace, task.assigneeId);
-      if (assigneeUserId) {
-        await createNotification({
-          userId: assigneeUserId,
-          text: `PR #${pullRequest.number} was ${action} by @${pullRequest.user.login}`,
+	      const assigneeUserId = getMemberUserId(workspace, task.assigneeId);
+	      if (assigneeUserId) {
+	        await createNotification({
+	          userId: assigneeUserId,
+	          text: `PR #${pullRequest.number} was ${action} by @${pullRequest.user.login}`,
           type: "github_pr",
           data: {
             taskId: String(task._id),
             taskRef,
             pullRequestUrl: pullRequest.html_url,
-          },
-        });
-      }
+	          },
+	        });
+	      }
 
       console.log(
         `[GitHub/PR] PR #${pullRequest.number} → task ${taskRef} → status: ${newStatus}`,
       );
     }
 
-    // Push event handler
-    async function handlePushEvent(payload) {
-      const { commits, repository, ref, installation } = payload;
-      if (!commits || commits.length === 0) return;
+	    // Push event handler
+	    async function handlePushEvent(payload) {
+	      const { commits, repository, ref, installation } = payload;
+	      if (!commits || commits.length === 0) return;
 
       // Find workspace from installation
-      const workspace = await getWorkspaceByInstallation(installation?.id);
-      if (!workspace) {
-        console.log(
-          `[GitHub/Push] No workspace found for installation ${installation?.id}`,
-        );
-        return;
-      }
+	      const workspace = await getWorkspaceByInstallation(installation?.id);
+	      if (!workspace) {
+	        console.log(
+	          `[GitHub/Push] No workspace found for installation ${installation?.id}`,
+	        );
+	        return;
+	      }
 
       const isMainBranch =
         ref === "refs/heads/main" || ref === "refs/heads/master";
 
-      for (const commit of commits) {
-        const taskRefs = extractAllTaskRefs(commit.message);
-        if (taskRefs.length === 0) continue;
+	      for (const commit of commits) {
+	        const taskRefs = extractAllTaskRefs(commit.message);
+	        if (taskRefs.length === 0) continue;
 
-        for (const taskRef of taskRefs) {
-          // Scope task search to this workspace
-          const task = await tasksCollection.findOne({
-            taskRef: taskRef,
-            workspaceId: workspace._id,
-          });
-          if (!task) continue;
+	        for (const taskRef of taskRefs) {
+	          // Scope task search to this workspace
+	          const task = await tasksCollection.findOne({
+	            taskRef: taskRef,
+	            workspaceId: workspace._id,
+	          });
+	          if (!task) continue;
 
           const branch = ref.replace("refs/heads/", "");
           // GitHub push payloads often include API URLs; store a human URL for UI.
@@ -306,17 +362,18 @@ async function run() {
 
           const newStatus = isMainBranch ? "done" : "in_progress";
 
-          await tasksCollection.updateOne(
-            { taskRef: taskRef, workspaceId: workspace._id },
-            { $set: { status: newStatus, updatedAt: now() } },
-          );
+	          await tasksCollection.updateOne(
+	            { taskRef: taskRef, workspaceId: workspace._id },
+	            { $set: { status: newStatus, updatedAt: now() } },
+	          );
+	            await moveTaskToStatusColumn(task, newStatus);
 
-          try {
-            await activitiesCollection.insertOne({
-              userId: "",
-              workspaceId: String(workspace._id),
-              projectId: String(task.projectId || ""),
-              taskId: String(task._id),
+	          try {
+	            await activitiesCollection.insertOne({
+	              userId: "",
+	              workspaceId: String(workspace._id),
+	              projectId: String(task.projectId || ""),
+	              taskId: String(task._id),
               action: "github_commit_pushed",
               text: `Commit pushed to ${isMainBranch ? "main" : branch} by @${githubUser}: "${commit.message}"`,
               meta: {
@@ -327,23 +384,22 @@ async function run() {
                 repositoryName: repository.full_name,
                 branch,
                 githubUsername: githubUser,
-              },
-              createdAt: now(),
-            });
-            console.log("[GitHub/Push] Activity inserted successfully");
-          } catch (err) {
-            console.error("[GitHub/Push] Activity insert failed:", err.message);
-          }
+	              },
+	              createdAt: now(),
+	            });
+	          } catch (err) {
+	            console.error("[GitHub/Push] Activity insert failed:", err.message);
+	          }
 
-          const assigneeUserId = getMemberUserId(workspace, task.assigneeId);
-          if (assigneeUserId) {
-            await createNotification({
-              userId: assigneeUserId,
-              text: `Commit pushed to ${branch} for "${task.title}"`,
-              type: "github_commit",
-              data: { taskId: String(task._id), taskRef, commitUrl },
-            });
-          }
+	          const assigneeUserId = getMemberUserId(workspace, task.assigneeId);
+	          if (assigneeUserId) {
+	            await createNotification({
+	              userId: assigneeUserId,
+	              text: `Commit pushed to ${branch} for "${task.title}"`,
+	              type: "github_commit",
+	              data: { taskId: String(task._id), taskRef, commitUrl },
+	            });
+	          }
 
           console.log(
             `[GitHub/Push] Commit ${commit.id.slice(0, 7)} → task ${taskRef}`,
@@ -3242,36 +3298,36 @@ async function run() {
 
     // Github WebHook ----------> Rifat Start
 
-    app.post("/github/webhook", async (req, res) => {
-      // Verify signature
-      if (!verifyGithubWebhookSignature(req)) {
-        return res.status(401).json({ error: "Invalid signature" });
-      }
+		    app.post("/github/webhook", async (req, res) => {
+		      // Verify signature
+		      if (!verifyGithubWebhookSignature(req)) {
+		        return res.status(401).json({ error: "Invalid signature" });
+		      }
 
-      const githubEventType = req.headers["x-github-event"];
-      if (!githubEventType)
-        return res.status(400).json({ error: "Missing x-github-event header" });
+		      const githubEventType = req.headers["x-github-event"];
+		      if (!githubEventType)
+		        return res.status(400).json({ error: "Missing x-github-event header" });
 
-      const eventHandler = githubEventHandlers[githubEventType];
-      if (!eventHandler)
-        return res
-          .status(200)
-          .json({ message: `Event "${githubEventType}" not handled` });
+	      const eventHandler = githubEventHandlers[githubEventType];
+	      if (!eventHandler)
+	        return res
+	          .status(200)
+	          .json({ message: `Event "${githubEventType}" not handled` });
 
-      await eventHandler(req.body);
-      return res
-        .status(200)
-        .json({ message: `Event "${githubEventType}" processed` });
-    });
+		      await eventHandler(req.body);
+		      return res
+		        .status(200)
+		        .json({ message: `Event "${githubEventType}" processed` });
+		    });
 
     // GitHub redirects the user back to the app after installation.
     // This must be protected; otherwise anyone could connect an installation to any workspaceId.
-    app.get("/github/callback", verifyToken, async (req, res) => {
-      const { installation_id, state } = req.query;
+		    app.get("/github/callback", verifyToken, async (req, res) => {
+		      const { installation_id, state } = req.query;
 
-      if (!installation_id) {
-        return res.status(400).json({ error: "Missing installation_id" });
-      }
+		      if (!installation_id) {
+		        return res.status(400).json({ error: "Missing installation_id" });
+		      }
 
       // state contains the workspaceId we passed when redirecting to GitHub
       const workspaceId = state;
@@ -3294,18 +3350,18 @@ async function run() {
         return res.status(403).json({ error: "Only admin can connect GitHub" });
       }
 
-      // Save or update the installation for this workspace
-      await githubInstallationsCollection.updateOne(
-        { workspaceId: workspaceId },
-        {
-          $set: {
-            workspaceId: workspaceId,
-            installationId: String(installation_id),
-            connectedAt: now(),
-          },
-        },
-        { upsert: true },
-      );
+		      // Save or update the installation for this workspace
+		      await githubInstallationsCollection.updateOne(
+		        { workspaceId: workspaceId },
+		        {
+		          $set: {
+	            workspaceId: workspaceId,
+	            installationId: String(installation_id),
+	            connectedAt: now(),
+	          },
+		        },
+		        { upsert: true },
+		      );
 
       // Redirect back to the workspace settings page
       return res.redirect(
@@ -3313,10 +3369,10 @@ async function run() {
       );
     });
 
-    app.get("/dashboard/github/status", verifyToken, async (req, res) => {
-      const { workspaceId } = req.query;
-      if (!workspaceId)
-        return res.status(400).json({ error: "Missing workspaceId" });
+		    app.get("/dashboard/github/status", verifyToken, async (req, res) => {
+		      const { workspaceId } = req.query;
+		      if (!workspaceId)
+		        return res.status(400).json({ error: "Missing workspaceId" });
       if (!isValidId(workspaceId))
         return res.status(400).json({ error: "Invalid workspaceId" });
 
@@ -3330,23 +3386,23 @@ async function run() {
         return res.status(403).json({ error: "Forbidden workspace access" });
       }
 
-      const installation = await githubInstallationsCollection.findOne({
-        workspaceId,
-      });
-      return res.json({
-        connected: Boolean(installation),
-        connectedAt: installation?.connectedAt || null,
-        installationId: installation?.installationId || null,
-      });
-    });
+		      const installation = await githubInstallationsCollection.findOne({
+		        workspaceId,
+		      });
+		      return res.json({
+		        connected: Boolean(installation),
+		        connectedAt: installation?.connectedAt || null,
+	        installationId: installation?.installationId || null,
+	      });
+	    });
 
-    app.delete(
-      "/dashboard/github/disconnect",
-      verifyToken,
-      async (req, res) => {
-        const { workspaceId } = req.body;
-        if (!workspaceId)
-          return res.status(400).json({ error: "Missing workspaceId" });
+	    app.delete(
+	      "/dashboard/github/disconnect",
+	      verifyToken,
+		      async (req, res) => {
+		        const { workspaceId } = req.body;
+		        if (!workspaceId)
+		          return res.status(400).json({ error: "Missing workspaceId" });
 
         // Check user is admin of this workspace
         const workspace = await workspacesCollection.findOne({
@@ -3364,20 +3420,20 @@ async function run() {
             .json({ error: "Only admins can disconnect GitHub" });
         }
 
-        await githubInstallationsCollection.deleteOne({ workspaceId });
+		        await githubInstallationsCollection.deleteOne({ workspaceId });
 
-        return res.json({ success: true });
-      },
-    );
+		        return res.json({ success: true });
+		      },
+		    );
 
-    app.get("/dashboard/tasks/:taskId/activities", async (req, res) => {
-      const { taskId } = req.params;
-      const activities = await activitiesCollection
-        .find({ taskId: taskId, action: { $regex: "^github_" } })
-        .sort({ createdAt: -1 })
-        .toArray();
-      return res.json(activities);
-    });
+		    app.get("/dashboard/tasks/:taskId/activities", async (req, res) => {
+		      const { taskId } = req.params;
+		      const activities = await activitiesCollection
+		        .find({ taskId: taskId, action: { $regex: "^github_" } })
+		        .sort({ createdAt: -1 })
+		        .toArray();
+		      return res.json(activities);
+		    });
 
     // Github WebHook ----------> Rifat End
 
