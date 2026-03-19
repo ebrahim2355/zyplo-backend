@@ -588,7 +588,20 @@ async function run() {
     };
 
     const getWorkspaceMemberById = (workspace, memberId) =>
-      (workspace?.members || []).find((m) => String(m.id) === String(memberId));
+      (workspace?.members || []).find(
+        (m) => String(m.id || m.userId || "") === String(memberId),
+      );
+
+    const isLastWorkspaceAdmin = (workspace, member, nextRole) => {
+      if (String(member?.role || "").toLowerCase() !== "admin") return false;
+      if (nextRole && String(nextRole).toLowerCase() === "admin") return false;
+
+      return (
+        (workspace?.members || []).filter(
+          (m) => String(m.role || "").toLowerCase() === "admin",
+        ).length === 1
+      );
+    };
 
     const getMemberUserId = (workspace, memberId) => {
       const member = getWorkspaceMemberById(workspace, memberId);
@@ -1824,7 +1837,16 @@ async function run() {
         id: String(w._id),
         name: w.name,
         slug: w.slug,
-        members: w.members || [],
+        members: (w.members || []).map((member) => ({
+          ...member,
+          id: String(member?.id || member?.userId || ""),
+          userId: String(member?.userId || ""),
+          name:
+            member?.name ||
+            (member?.email ? member.email.split("@")[0] : "Member"),
+          email: member?.email || "",
+          role: member?.role || "member",
+        })),
       }));
 
       const userDoc = await findAuthUserDoc(me);
@@ -4310,6 +4332,108 @@ async function run() {
           console.error(error);
           return res.status(500).json({ ok: false, message: "Server error" });
         }
+      },
+    );
+
+    app.patch(
+      "/dashboard/workspaces/:workspaceId/members/:memberId",
+      verifyToken,
+      async (req, res) => {
+        const { workspaceId, memberId } = req.params;
+        if (!isValidId(workspaceId) || !String(memberId || "").trim())
+          return res.status(400).json({ error: "Invalid id provided" });
+        const nextRoleResult = inviteSchema.shape.role.safeParse(
+          String(req.body?.role || "")
+            .trim()
+            .toLowerCase(),
+        );
+        if (!nextRoleResult.success)
+          return res.status(400).json({ error: "Invalid member role" });
+        const nextRole = nextRoleResult.data;
+
+        const me = getUserIdentity(req);
+        const workspace = await workspacesCollection.findOne({
+          _id: toId(workspaceId),
+        });
+        if (!workspace)
+          return res.status(404).json({ error: "Workspace not found" });
+        if (!isWorkspaceAdmin(workspace, me))
+          return res
+            .status(403)
+            .json({ error: "Only admin can update members" });
+
+        const member = getWorkspaceMemberById(workspace, memberId);
+        if (!member) return res.status(404).json({ error: "Member not found" });
+
+        if (isLastWorkspaceAdmin(workspace, member, nextRole)) {
+          return res
+            .status(400)
+            .json({ error: "This workspace must keep at least one admin." });
+        }
+
+        if (String(member.role || "").toLowerCase() === nextRole) {
+          return res.json({ member: { ...member, role: nextRole } });
+        }
+
+        const memberKey = String(member.id || member.userId || "");
+        await workspacesCollection.updateOne(
+          { _id: toId(workspaceId) },
+          {
+            $set: {
+              members: (workspace.members || []).map((currentMember) =>
+                String(currentMember.id || currentMember.userId || "") === memberKey
+                  ? { ...currentMember, role: nextRole }
+                  : currentMember,
+              ),
+            },
+          },
+        );
+
+        return res.json({ member: { ...member, role: nextRole } });
+      },
+    );
+
+    app.delete(
+      "/dashboard/workspaces/:workspaceId/members/:memberId",
+      verifyToken,
+      async (req, res) => {
+        const { workspaceId, memberId } = req.params;
+        if (!isValidId(workspaceId) || !String(memberId || "").trim())
+          return res.status(400).json({ error: "Invalid id provided" });
+        const me = getUserIdentity(req);
+
+        const workspace = await workspacesCollection.findOne({
+          _id: toId(workspaceId),
+        });
+        if (!workspace)
+          return res.status(404).json({ error: "Workspace not found" });
+        if (!isWorkspaceAdmin(workspace, me))
+          return res
+            .status(403)
+            .json({ error: "Only admin can remove members" });
+
+        const member = getWorkspaceMemberById(workspace, memberId);
+        if (!member) return res.status(404).json({ error: "Member not found" });
+
+        if (isLastWorkspaceAdmin(workspace, member)) {
+          return res
+            .status(400)
+            .json({ error: "This workspace must keep at least one admin." });
+        }
+
+        const memberKey = String(member.id || member.userId || "");
+        await workspacesCollection.updateOne(
+          { _id: toId(workspaceId) },
+          {
+            $pull: {
+              members: {
+                $or: [{ id: memberKey }, { userId: memberKey }],
+              },
+            },
+          },
+        );
+
+        return res.json({ ok: true });
       },
     );
 
