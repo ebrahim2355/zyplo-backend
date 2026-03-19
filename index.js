@@ -992,7 +992,6 @@ async function run() {
           $setOnInsert: {
             ownerType: owner.type,
             ownerId: owner.id,
-            workspaceId: owner.workspaceId,
             createdAt: timestamp,
           },
           $set: pickDefined({
