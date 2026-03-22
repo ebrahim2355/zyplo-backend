@@ -642,24 +642,13 @@ async function run() {
       return [...recipients];
     };
 
-    const optionalWorkspaceIdSchema = z.preprocess((value) => {
-      const text = String(value ?? "").trim();
-      return text || undefined;
-    }, z.string().min(1).optional());
-
     const checkoutSessionSchema = z
       .object({
         planId: z.enum(["starter", "team", "studio"]),
         billingCycle: z.enum(["monthly", "yearly"]),
-        workspaceId: optionalWorkspaceIdSchema,
       })
       .strict();
-    // for billing
-    const billingWorkspaceBodySchema = z
-      .object({
-        workspaceId: optionalWorkspaceIdSchema,
-      })
-      .strict();
+    const billingRequestSchema = z.object({}).strict();
 
     const BILLING_ALLOWED_ACCESS_STATUSES = new Set(["active", "trialing"]);
     const BILLING_TERMINAL_STATUSES = new Set([
@@ -731,14 +720,15 @@ async function run() {
       return url.toString();
     };
 
-    const buildCheckoutSuccessUrl = (workspaceId) => {
+    const buildCheckoutSuccessUrl = () => {
       const placeholder = "{CHECKOUT_SESSION_ID}";
       return buildAppUrl("/pricing", {
         checkout: "success",
         session_id: placeholder,
-        workspaceId,
       }).replace(encodeURIComponent(placeholder), placeholder);
     };
+
+    const buildBillingReturnUrl = () => buildAppUrl("/pricing");
 
     const getStripeClient = () => {
       const secretKey = cleanEnvValue(process.env.STRIPE_SECRET_KEY);
@@ -808,15 +798,16 @@ async function run() {
       };
     };
 
-    const resolveBillingWorkspace = async ({
-      me,
-      workspaceId,
-      requireAdmin = true,
-    }) => {
-      const myId = String(me?.id || "");
-      const myEmail = normalizeEmail(me?.email);
+    const getBillingOwnerType = (value, fallback = "workspace") => {
+      const ownerType = String(value || "")
+        .trim()
+        .toLowerCase();
+      return ownerType || fallback;
+    };
 
-      if (!myId && !myEmail) {
+    const getBillingOwnerFromUser = (me) => {
+      const userId = String(me?.id || "").trim();
+      if (!userId) {
         throw createBillingHttpError(
           401,
           "UNAUTHORIZED",
@@ -824,144 +815,85 @@ async function run() {
         );
       }
 
-      if (workspaceId) {
-        if (!isValidId(workspaceId)) {
-          throw createBillingHttpError(
-            400,
-            "INVALID_WORKSPACE_ID",
-            "Invalid workspaceId",
-          );
-        }
-
-        const workspace = await workspacesCollection.findOne({
-          _id: toId(workspaceId),
-        });
-
-        if (!workspace) {
-          throw createBillingHttpError(
-            404,
-            "WORKSPACE_NOT_FOUND",
-            "Workspace not found",
-          );
-        }
-
-        const hasAccess = requireAdmin
-          ? isWorkspaceAdmin(workspace, me)
-          : isWorkspaceMember(workspace, me);
-
-        if (!hasAccess) {
-          throw createBillingHttpError(
-            403,
-            requireAdmin
-              ? "BILLING_ADMIN_REQUIRED"
-              : "FORBIDDEN_WORKSPACE_ACCESS",
-            requireAdmin
-              ? "Only workspace admins can manage billing"
-              : "Forbidden workspace access",
-          );
-        }
-
-        return workspace;
-      }
-
-      const queryClauses = [];
-      if (myId) {
-        queryClauses.push(
-          requireAdmin
-            ? { members: { $elemMatch: { userId: myId, role: "admin" } } }
-            : { "members.userId": myId },
-        );
-      }
-      if (myEmail) {
-        queryClauses.push(
-          requireAdmin
-            ? { members: { $elemMatch: { email: myEmail, role: "admin" } } }
-            : { "members.email": myEmail },
-        );
-      }
-
-      const workspaceDocs = await workspacesCollection
-        .find({ $or: queryClauses })
-        .sort({ createdAt: -1 })
-        .toArray();
-
-      const visibleWorkspaces = workspaceDocs.filter((workspace) =>
-        requireAdmin
-          ? isWorkspaceAdmin(workspace, me)
-          : isWorkspaceMember(workspace, me),
-      );
-
-      if (!visibleWorkspaces.length) {
-        throw createBillingHttpError(
-          404,
-          "WORKSPACE_NOT_FOUND",
-          requireAdmin
-            ? "No workspace was found where you can manage billing"
-            : "No workspace was found for this account",
-        );
-      }
-
-      if (visibleWorkspaces.length > 1) {
-        throw createBillingHttpError(
-          400,
-          "WORKSPACE_REQUIRED",
-          "workspaceId is required when you have access to multiple workspaces",
-        );
-      }
-
-      return visibleWorkspaces[0];
+      return {
+        type: "user",
+        id: userId,
+        billingContactUserId: userId,
+        billingContactName: String(me?.name || "User").trim() || "User",
+        email: normalizeEmail(me?.email),
+      };
     };
-
-    const getBillingOwnerFromWorkspace = (workspace, me) => ({
-      type: "workspace",
-      id: String(workspace?._id || ""),
-      workspaceId: String(workspace?._id || ""),
-      workspaceName: String(workspace?.name || ""),
-      billingContactUserId: String(me?.id || ""),
-      billingContactName: String(me?.name || "User"),
-      email: normalizeEmail(me?.email),
-    });
 
     const getBillingOwnerFromDoc = (billingDoc) => {
       if (!billingDoc) return null;
-      const ownerType = String(billingDoc.ownerType || "workspace");
-      const ownerId = String(
-        billingDoc.ownerId || billingDoc.workspaceId || "",
+      const ownerType = getBillingOwnerType(
+        billingDoc.ownerType,
+        billingDoc.workspaceId ? "workspace" : "user",
       );
+      const ownerId = String(
+        billingDoc.ownerId ||
+          (ownerType === "user"
+            ? billingDoc.billingContactUserId
+            : billingDoc.workspaceId) ||
+          billingDoc.workspaceId ||
+          "",
+      ).trim();
       if (!ownerId) return null;
 
       return {
         type: ownerType,
         id: ownerId,
-        workspaceId: String(billingDoc.workspaceId || ownerId),
-        workspaceName: String(billingDoc.workspaceName || ""),
-        billingContactUserId: String(billingDoc.billingContactUserId || ""),
-        billingContactName: String(billingDoc.billingContactName || "User"),
+        workspaceId:
+          ownerType === "workspace"
+            ? String(billingDoc.workspaceId || ownerId).trim()
+            : "",
+        workspaceName:
+          ownerType === "workspace"
+            ? String(billingDoc.workspaceName || "").trim()
+            : "",
+        billingContactUserId: String(
+          billingDoc.billingContactUserId ||
+            (ownerType === "user" ? ownerId : ""),
+        ).trim(),
+        billingContactName: String(
+          billingDoc.billingContactName || "User",
+        ).trim(),
         email: normalizeEmail(billingDoc.billingEmail || ""),
       };
     };
 
     const getBillingOwnerFromMetadata = (metadata = {}) => {
+      const workspaceId = String(
+        metadata.workspaceId || metadata.workspace_id || "",
+      ).trim();
+      const ownerType = getBillingOwnerType(
+        metadata.ownerType || metadata.owner_type,
+        workspaceId ? "workspace" : "user",
+      );
       const ownerId = String(
         metadata.ownerId ||
           metadata.owner_id ||
-          metadata.workspaceId ||
-          metadata.workspace_id ||
+          (ownerType === "user"
+            ? metadata.billingContactUserId ||
+              metadata.billing_contact_user_id
+            : workspaceId) ||
+          workspaceId ||
           "",
       ).trim();
 
       if (!ownerId) return null;
 
       return {
-        type: String(metadata.ownerType || metadata.owner_type || "workspace"),
+        type: ownerType,
         id: ownerId,
-        workspaceId: String(
-          metadata.workspaceId || metadata.workspace_id || ownerId,
+        workspaceId: ownerType === "workspace" ? workspaceId || ownerId : "",
+        workspaceName: String(
+          metadata.workspaceName || metadata.workspace_name || "",
         ).trim(),
-        workspaceName: "",
         billingContactUserId: String(
           metadata.billingContactUserId ||
             metadata.billing_contact_user_id ||
+            (ownerType === "user" ? ownerId : "") ||
             "",
         ).trim(),
         billingContactName: String(
@@ -974,6 +906,23 @@ async function run() {
         ),
       };
     };
+
+    const buildBillingOwnerMetadata = (owner) =>
+      pickDefined({
+        ownerType: owner.type,
+        ownerId: owner.id,
+        workspaceId:
+          owner.type === "workspace" ? owner.workspaceId || undefined : undefined,
+        workspaceName:
+          owner.type === "workspace"
+            ? owner.workspaceName || undefined
+            : undefined,
+        billingContactUserId:
+          owner.billingContactUserId ||
+          (owner.type === "user" ? owner.id : undefined),
+        billingContactName: owner.billingContactName || undefined,
+        billingEmail: owner.email || undefined,
+      });
 
     const getBillingAccountByOwner = async (owner) =>
       billingAccountsCollection.findOne({
@@ -995,7 +944,7 @@ async function run() {
             createdAt: timestamp,
           },
           $set: pickDefined({
-            workspaceId: owner.workspaceId,
+            workspaceId: owner.workspaceId || undefined,
             workspaceName: owner.workspaceName || undefined,
             billingContactUserId: owner.billingContactUserId || undefined,
             billingContactName: owner.billingContactName || undefined,
@@ -1022,8 +971,11 @@ async function run() {
         owner: {
           type: owner.type,
           id: owner.id,
-          workspaceId: owner.workspaceId,
-          workspaceName: owner.workspaceName,
+          billingContactUserId:
+            owner.billingContactUserId ||
+            (owner.type === "user" ? owner.id : ""),
+          billingContactName: owner.billingContactName || "User",
+          billingEmail: owner.email || billingDoc?.billingEmail || "",
         },
         subscription: {
           planId: billingDoc?.planId || null,
@@ -1051,7 +1003,7 @@ async function run() {
       throw createBillingHttpError(
         409,
         "SUBSCRIPTION_EXISTS",
-        "This workspace already has a Stripe subscription. Use the billing portal to manage it instead.",
+        "This account already has a Stripe subscription. Use the billing portal to manage it instead.",
         mapSubscriptionResponse({ owner, billingDoc }).subscription,
       );
     };
@@ -1099,13 +1051,8 @@ async function run() {
       const customer = await stripe.customers.create(
         pickDefined({
           email: owner.email || undefined,
-          name: owner.workspaceName || owner.billingContactName || undefined,
-          metadata: pickDefined({
-            ownerType: owner.type,
-            ownerId: owner.id,
-            workspaceId: owner.workspaceId,
-            billingContactUserId: owner.billingContactUserId,
-          }),
+          name: owner.billingContactName || owner.workspaceName || undefined,
+          metadata: buildBillingOwnerMetadata(owner),
         }),
       );
 
@@ -1118,14 +1065,9 @@ async function run() {
 
     const buildCheckoutMetadata = ({ owner, planId, billingCycle }) =>
       pickDefined({
-        ownerType: owner.type,
-        ownerId: owner.id,
-        workspaceId: owner.workspaceId,
+        ...buildBillingOwnerMetadata(owner),
         planId,
         billingCycle,
-        billingContactUserId: owner.billingContactUserId,
-        billingContactName: owner.billingContactName,
-        billingEmail: owner.email,
       });
 
     const getBillingAccountForStripeObject = async ({
@@ -1337,9 +1279,7 @@ async function run() {
     // billing api
     app.get("/api/billing/subscription", verifyToken, async (req, res) => {
       try {
-        const parsedQuery = billingWorkspaceBodySchema.safeParse(
-          req.query || {},
-        );
+        const parsedQuery = billingRequestSchema.safeParse(req.query || {});
         if (!parsedQuery.success) {
           throw createBillingHttpError(
             400,
@@ -1350,12 +1290,7 @@ async function run() {
         }
 
         const me = await getBillingActor(req);
-        const workspace = await resolveBillingWorkspace({
-          me,
-          workspaceId: parsedQuery.data.workspaceId,
-          requireAdmin: false,
-        });
-        const owner = getBillingOwnerFromWorkspace(workspace, me);
+        const owner = getBillingOwnerFromUser(me);
         const billingDoc = await getBillingAccountByOwner(owner);
 
         return res.json(mapSubscriptionResponse({ owner, billingDoc }));
@@ -1388,7 +1323,7 @@ async function run() {
           );
         }
 
-        const { planId, billingCycle, workspaceId } = parsedBody.data;
+        const { planId, billingCycle } = parsedBody.data;
         if (planId === "studio") {
           throw createBillingHttpError(
             400,
@@ -1398,12 +1333,7 @@ async function run() {
         }
 
         const me = await getBillingActor(req);
-        const workspace = await resolveBillingWorkspace({
-          me,
-          workspaceId,
-          requireAdmin: true,
-        });
-        const owner = getBillingOwnerFromWorkspace(workspace, me);
+        const owner = getBillingOwnerFromUser(me);
         const existingBilling = await getBillingAccountByOwner(owner);
         ensureCheckoutAllowed(existingBilling, owner);
 
@@ -1421,10 +1351,9 @@ async function run() {
           customer: customer?.id || undefined,
           customer_email: customer?.id ? undefined : owner.email || undefined,
           client_reference_id: owner.id,
-          success_url: buildCheckoutSuccessUrl(owner.workspaceId),
+          success_url: buildCheckoutSuccessUrl(),
           cancel_url: buildAppUrl("/pricing", {
             checkout: "cancelled",
-            workspaceId: owner.workspaceId,
           }),
           metadata,
           subscription_data: {
@@ -1467,7 +1396,7 @@ async function run() {
 
     app.post("/api/billing/portal-session", verifyToken, async (req, res) => {
       try {
-        const parsedBody = billingWorkspaceBodySchema.safeParse(req.body || {});
+        const parsedBody = billingRequestSchema.safeParse(req.body || {});
         if (!parsedBody.success) {
           throw createBillingHttpError(
             400,
@@ -1478,28 +1407,21 @@ async function run() {
         }
 
         const me = await getBillingActor(req);
-        const workspace = await resolveBillingWorkspace({
-          me,
-          workspaceId: parsedBody.data.workspaceId,
-          requireAdmin: true,
-        });
-        const owner = getBillingOwnerFromWorkspace(workspace, me);
+        const owner = getBillingOwnerFromUser(me);
         const billingDoc = await getBillingAccountByOwner(owner);
 
         if (!billingDoc?.stripeCustomerId) {
           throw createBillingHttpError(
             404,
             "BILLING_CUSTOMER_NOT_FOUND",
-            "No Stripe customer exists for this workspace yet",
+            "No Stripe customer exists for this account yet",
           );
         }
 
         const stripe = getStripeClient();
         const session = await stripe.billingPortal.sessions.create({
           customer: billingDoc.stripeCustomerId,
-          return_url: buildAppUrl("/pricing", {
-            workspaceId: owner.workspaceId,
-          }),
+          return_url: buildBillingReturnUrl(),
         });
 
         await upsertBillingAccount(owner, {

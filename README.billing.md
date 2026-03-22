@@ -1,15 +1,18 @@
 # Zyplo Stripe Billing API
 
-This backend now supports workspace-scoped Stripe subscriptions for the
-`starter` and `team` plans.
+This backend supports user-scoped Stripe subscriptions for the `starter` and
+`team` plans.
 
 ## Billing model
 
-- Billing is stored per workspace in MongoDB.
-- Only workspace admins can create Checkout or Billing Portal sessions.
-- Any workspace member can read the current subscription status.
+- Billing belongs to the authenticated user, not a workspace.
+- The server never accepts `userId` or `workspaceId` for billing ownership.
+- New billing documents in `billingAccounts` use `ownerType: "user"` and
+  `ownerId: <authenticated user id>`.
 - `studio` is intentionally blocked from self-serve checkout.
 - Stripe webhooks are the source of truth for subscription state.
+- Existing workspace-owned billing records can still be synced by webhook, but
+  all new billing flows are user-owned.
 
 MongoDB collections used:
 
@@ -37,15 +40,14 @@ falls back to `FRONTEND_URL`, then `http://localhost:3000`.
 
 ### `POST /api/billing/checkout-session`
 
-Starts a Stripe Checkout subscription flow for `starter` or `team`.
+Starts a Stripe Checkout subscription flow for the authenticated user.
 
 Request body:
 
 ```json
 {
   "planId": "starter",
-  "billingCycle": "monthly",
-  "workspaceId": "65f1f5c9fd4d7d13d81f0abc"
+  "billingCycle": "monthly"
 }
 ```
 
@@ -57,11 +59,11 @@ Response:
 }
 ```
 
-Failure example when a workspace already has a non-terminal subscription:
+Failure example when the user already has a non-terminal subscription:
 
 ```json
 {
-  "error": "This workspace already has a Stripe subscription. Use the billing portal to manage it instead.",
+  "error": "This account already has a Stripe subscription. Use the billing portal to manage it instead.",
   "code": "SUBSCRIPTION_EXISTS",
   "details": {
     "planId": "team",
@@ -84,18 +86,15 @@ Notes:
 
 - `studio` returns `PLAN_NOT_SELF_SERVE`.
 - `planId`, `billingCycle`, and Stripe price selection are validated server-side.
-- If the user has access to multiple workspaces, send `workspaceId`.
 
 ### `POST /api/billing/portal-session`
 
-Creates a Stripe Billing Portal session for the workspace customer.
+Creates a Stripe Billing Portal session for the authenticated user.
 
 Request body:
 
 ```json
-{
-  "workspaceId": "65f1f5c9fd4d7d13d81f0abc"
-}
+{}
 ```
 
 Response:
@@ -108,12 +107,12 @@ Response:
 
 ### `GET /api/billing/subscription`
 
-Returns the normalized billing status for the current workspace.
+Returns the normalized billing status for the authenticated user.
 
 Example request:
 
 ```txt
-GET /api/billing/subscription?workspaceId=65f1f5c9fd4d7d13d81f0abc
+GET /api/billing/subscription
 ```
 
 Example response:
@@ -121,10 +120,11 @@ Example response:
 ```json
 {
   "owner": {
-    "type": "workspace",
+    "type": "user",
     "id": "65f1f5c9fd4d7d13d81f0abc",
-    "workspaceId": "65f1f5c9fd4d7d13d81f0abc",
-    "workspaceName": "Acme"
+    "billingContactUserId": "65f1f5c9fd4d7d13d81f0abc",
+    "billingContactName": "Jane Doe",
+    "billingEmail": "jane@example.com"
   },
   "subscription": {
     "planId": "starter",
@@ -164,11 +164,11 @@ The webhook is idempotent and uses `billingWebhookEvents` to track processing.
 ## Frontend integration notes
 
 - Send the backend JWT in `Authorization: Bearer <token>`.
-- Pass `workspaceId` whenever the signed-in user can access multiple workspaces.
+- Do not send `userId` or `workspaceId` to billing endpoints.
 - After redirecting back from Stripe Checkout, do not trust the query string as
   proof of payment. Fetch `GET /api/billing/subscription` and render from that.
 - Use the returned `url` from checkout or portal endpoints and redirect the
   browser there.
-- The backend currently sends Stripe success/cancel and portal return URLs back
-  to `/pricing` on the frontend. If you want a dedicated billing page later,
+- The backend currently sends Stripe success, cancel, and portal return URLs to
+  `/pricing` on the frontend. If you want a dedicated billing page later,
   update the URL builders in `index.js`.
