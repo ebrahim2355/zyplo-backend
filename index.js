@@ -8,9 +8,10 @@ const jwt = require("jsonwebtoken");
 const { z } = require("zod");
 const crypto = require("crypto");
 const nodemailer = require("nodemailer");
+const Stripe = require("stripe");
 const port = process.env.PORT || 5000;
 
-// setServers(["1.1.1.1", "8.8.8.8"]);
+setServers(["1.1.1.1", "8.8.8.8"]);
 
 app.use(
   cors({
@@ -24,7 +25,8 @@ app.use(
 app.use(
   express.json({
     verify: (req, _res, buf) => {
-      if (req.originalUrl === "/github/webhook") {
+      const url = String(req.originalUrl || "");
+      if (url === "/github/webhook" || url.startsWith("/api/billing/webhook")) {
         req.rawBody = buf; // Buffer
       }
     },
@@ -79,6 +81,8 @@ async function run() {
     const commentsCollection = db.collection("comments");
     const activitiesCollection = db.collection("activities");
     const githubInstallationsCollection = db.collection("githubInstallations");
+    const billingAccountsCollection = db.collection("billingAccounts");
+    const billingEventsCollection = db.collection("billingWebhookEvents");
 
     await notificationsCollection.createIndex({ userId: 1, createdAt: -1 });
     await notificationsCollection.createIndex({ userId: 1, read: 1 });
@@ -93,6 +97,20 @@ async function run() {
     await timeLogsCollection.createIndex({ projectId: 1 });
     await timeLogsCollection.createIndex({ workspaceId: 1 });
     await timeLogsCollection.createIndex({ startTime: 1 });
+    await billingAccountsCollection.createIndex(
+      { ownerType: 1, ownerId: 1 },
+      { unique: true },
+    );
+    await billingAccountsCollection.createIndex(
+      { stripeCustomerId: 1 },
+      { unique: true, sparse: true },
+    );
+    await billingAccountsCollection.createIndex(
+      { stripeSubscriptionId: 1 },
+      { unique: true, sparse: true },
+    );
+    await billingAccountsCollection.createIndex({ workspaceId: 1 });
+    await billingEventsCollection.createIndex({ eventId: 1 }, { unique: true });
     try {
       await timeLogsCollection.createIndex(
         { userId: 1, endTime: 1 },
@@ -119,8 +137,8 @@ async function run() {
         .trim()
         .toLowerCase();
 
-		    // --Github Integration Start--
-		    const TASK_REF_PATTERN = /([A-Z]{2,6})-(\d+)/g;
+    // --Github Integration Start--
+    const TASK_REF_PATTERN = /([A-Z]{2,6})-(\d+)/g;
 
     // For PR titles — returns first match only e.g. "AUTH-1"
     function extractTaskRef(text) {
@@ -142,19 +160,19 @@ async function run() {
       TASK_REF_PATTERN.lastIndex = 0;
       return refs;
     }
-	    // Verify Signature
-		    function verifyGithubWebhookSignature(req) {
-		      try {
-		        const secret = process.env.GITHUB_WEBHOOK_SECRET;
-		        if (!secret) return true; // skip if no secret configured
+    // Verify Signature
+    function verifyGithubWebhookSignature(req) {
+      try {
+        const secret = process.env.GITHUB_WEBHOOK_SECRET;
+        if (!secret) return true; // skip if no secret configured
 
-		        const signature = String(req.headers["x-hub-signature-256"] || "");
-		        if (!signature.startsWith("sha256=")) return false;
+        const signature = String(req.headers["x-hub-signature-256"] || "");
+        if (!signature.startsWith("sha256=")) return false;
 
-	        // IMPORTANT: GitHub signs the raw request bytes, not the parsed JSON.
-	        // We capture raw bytes via express.json({ verify }) for /github/webhook.
-	        const raw = Buffer.isBuffer(req.rawBody)
-	          ? req.rawBody
+        // IMPORTANT: GitHub signs the raw request bytes, not the parsed JSON.
+        // We capture raw bytes via express.json({ verify }) for /github/webhook.
+        const raw = Buffer.isBuffer(req.rawBody)
+          ? req.rawBody
           : Buffer.from(JSON.stringify(req.body || {}), "utf8");
 
         const hmac = crypto.createHmac("sha256", secret);
@@ -169,100 +187,117 @@ async function run() {
         return false;
       }
     }
-		    // get Workspace
-		    async function getWorkspaceByInstallation(installationId) {
-		      if (!installationId) return null;
-		      const installation = await githubInstallationsCollection.findOne({
-		        installationId: String(installationId),
-		      });
-		      if (!installation) return null;
-		      if (!isValidId(installation.workspaceId)) return null;
-		      return await workspacesCollection.findOne({
-		        _id: toId(installation.workspaceId),
-		      });
-		    }
+    // get Workspace
+    async function getWorkspaceByInstallation(installationId) {
+      if (!installationId) return null;
+      const installation = await githubInstallationsCollection.findOne({
+        installationId: String(installationId),
+      });
+      if (!installation) return null;
+      if (!isValidId(installation.workspaceId)) return null;
+      return await workspacesCollection.findOne({
+        _id: toId(installation.workspaceId),
+      });
+    }
 
-      // Move task helper
-     async function moveTaskToStatusColumn(task, newStatus) {
-  // Find the board for this task — columns are embedded in the board document
-  const board = await boardsCollection.findOne({ projectId: task.projectId });
-  if (!board) {
-    console.log("[Move] No board found for projectId:", task.projectId);
-    return;
-  }
+    // Move task helper
+    async function moveTaskToStatusColumn(task, newStatus) {
+      // Find the board for this task — columns are embedded in the board document
+      const board = await boardsCollection.findOne({
+        projectId: task.projectId,
+      });
+      if (!board) {
+        console.log("[Move] No board found for projectId:", task.projectId);
+        return;
+      }
 
-  // Columns are stored as board.columns array (embedded)
-  const columns = board.columns || [];
-  if (!columns.length) {
-    console.log("[Move] No columns found in board");
-    return;
-  }
+      // Columns are stored as board.columns array (embedded)
+      const columns = board.columns || [];
+      if (!columns.length) {
+        console.log("[Move] No columns found in board");
+        return;
+      }
 
-  function normalizeStr(name) {
-    return String(name || "").toLowerCase().replace(/[^a-z]/g, "");
-  }
+      function normalizeStr(name) {
+        return String(name || "")
+          .toLowerCase()
+          .replace(/[^a-z]/g, "");
+      }
 
-  function statusMatchesColumn(columnName, status) {
-    const col = normalizeStr(columnName);
-    const s = normalizeStr(status); // strips underscores too: "in_progress" → "inprogress"
-    if (s === "todo" && (col === "todo" || col === "backlog")) return true;
-    if (s === "inprogress" && (col === "inprogress" || col === "doing")) return true;
-    if (s === "inreview" && (col === "inreview" || col === "review")) return true;
-    if (s === "done" && (col === "done" || col === "completed")) return true;
-    return false;
-  }
+      function statusMatchesColumn(columnName, status) {
+        const col = normalizeStr(columnName);
+        const s = normalizeStr(status); // strips underscores too: "in_progress" → "inprogress"
+        if (s === "todo" && (col === "todo" || col === "backlog")) return true;
+        if (s === "inprogress" && (col === "inprogress" || col === "doing"))
+          return true;
+        if (s === "inreview" && (col === "inreview" || col === "review"))
+          return true;
+        if (s === "done" && (col === "done" || col === "completed"))
+          return true;
+        return false;
+      }
 
-  const targetColumn = columns.find((col) =>
-    statusMatchesColumn(col.name, newStatus)
-  );
+      const targetColumn = columns.find((col) =>
+        statusMatchesColumn(col.name, newStatus),
+      );
 
-  if (!targetColumn) {
-    console.log("[Move] No matching column for status:", newStatus, "| columns:", columns.map(c => c.name));
-    return;
-  }
+      if (!targetColumn) {
+        console.log(
+          "[Move] No matching column for status:",
+          newStatus,
+          "| columns:",
+          columns.map((c) => c.name),
+        );
+        return;
+      }
 
-  // Don't move if already in the right column
-  if (String(task.columnId) === String(targetColumn._id)) {
-    console.log("[Move] Task already in correct column");
-    return;
-  }
+      // Don't move if already in the right column
+      if (String(task.columnId) === String(targetColumn._id)) {
+        console.log("[Move] Task already in correct column");
+        return;
+      }
 
-  console.log("[Move] Moving task", task.taskRef, "to column:", targetColumn.name);
+      console.log(
+        "[Move] Moving task",
+        task.taskRef,
+        "to column:",
+        targetColumn.name,
+      );
 
-  // Move task to target column
-  await tasksCollection.updateOne(
-    { _id: task._id },
-    { $set: { columnId: targetColumn._id, updatedAt: now() } }
-  );
-}
+      // Move task to target column
+      await tasksCollection.updateOne(
+        { _id: task._id },
+        { $set: { columnId: targetColumn._id, updatedAt: now() } },
+      );
+    }
 
-	    // PR event handler
-	    async function handlePullRequestEvent(payload) {
-	      const {
-	        action,
-	        pull_request: pullRequest,
-	        repository,
-	        installation,
-	      } = payload;
+    // PR event handler
+    async function handlePullRequestEvent(payload) {
+      const {
+        action,
+        pull_request: pullRequest,
+        repository,
+        installation,
+      } = payload;
 
-	      const taskRef = extractTaskRef(pullRequest.title);
-	      if (!taskRef) return;
+      const taskRef = extractTaskRef(pullRequest.title);
+      if (!taskRef) return;
 
-	      // Find workspace from installation
-	      const workspace = await getWorkspaceByInstallation(installation?.id);
-	      if (!workspace) {
-	        console.log(
-	          `[GitHub/PR] No workspace found for installation ${installation?.id}`,
-	        );
-	        return;
-	      }
+      // Find workspace from installation
+      const workspace = await getWorkspaceByInstallation(installation?.id);
+      if (!workspace) {
+        console.log(
+          `[GitHub/PR] No workspace found for installation ${installation?.id}`,
+        );
+        return;
+      }
 
-	      // Scope task search to this workspace
-	      const task = await tasksCollection.findOne({
-	        taskRef: taskRef,
-	        workspaceId: workspace._id,
-	      });
-	      if (!task) return;
+      // Scope task search to this workspace
+      const task = await tasksCollection.findOne({
+        taskRef: taskRef,
+        workspaceId: workspace._id,
+      });
+      if (!task) return;
 
       const newStatus =
         action === "opened"
@@ -275,21 +310,20 @@ async function run() {
                 ? "todo"
                 : null;
 
-	      if (newStatus) {
-	        await tasksCollection.updateOne(
-	          { taskRef: taskRef, workspaceId: workspace._id },
-	          { $set: { status: newStatus, updatedAt: now() } },
-	        );
-	            await moveTaskToStatusColumn(task, newStatus);
+      if (newStatus) {
+        await tasksCollection.updateOne(
+          { taskRef: taskRef, workspaceId: workspace._id },
+          { $set: { status: newStatus, updatedAt: now() } },
+        );
+        await moveTaskToStatusColumn(task, newStatus);
+      }
 
-	      }
-
-	      try {
-	        await activitiesCollection.insertOne({
-	          userId: "",
-	          workspaceId: String(workspace._id),
-	          projectId: String(task.projectId || ""),
-	          taskId: String(task._id),
+      try {
+        await activitiesCollection.insertOne({
+          userId: "",
+          workspaceId: String(workspace._id),
+          projectId: String(task.projectId || ""),
+          taskId: String(task._id),
           action: `github_pr_${action}`,
           text: `PR #${pullRequest.number} "${pullRequest.title}" ${action} by @${pullRequest.user.login}`,
           meta: {
@@ -299,60 +333,60 @@ async function run() {
             repositoryName: repository.full_name,
             githubUsername: pullRequest.user.login,
             githubAvatarUrl: pullRequest.user.avatar_url,
-	          },
-	          createdAt: now(),
-	        });
-	      } catch (err) {
-	        console.error("[GitHub/PR] Activity insert failed:", err.message);
-	      }
+          },
+          createdAt: now(),
+        });
+      } catch (err) {
+        console.error("[GitHub/PR] Activity insert failed:", err.message);
+      }
 
-	      const assigneeUserId = getMemberUserId(workspace, task.assigneeId);
-	      if (assigneeUserId) {
-	        await createNotification({
-	          userId: assigneeUserId,
-	          text: `PR #${pullRequest.number} was ${action} by @${pullRequest.user.login}`,
+      const assigneeUserId = getMemberUserId(workspace, task.assigneeId);
+      if (assigneeUserId) {
+        await createNotification({
+          userId: assigneeUserId,
+          text: `PR #${pullRequest.number} was ${action} by @${pullRequest.user.login}`,
           type: "github_pr",
           data: {
             taskId: String(task._id),
             taskRef,
             pullRequestUrl: pullRequest.html_url,
-	          },
-	        });
-	      }
+          },
+        });
+      }
 
       console.log(
         `[GitHub/PR] PR #${pullRequest.number} → task ${taskRef} → status: ${newStatus}`,
       );
     }
 
-	    // Push event handler
-	    async function handlePushEvent(payload) {
-	      const { commits, repository, ref, installation } = payload;
-	      if (!commits || commits.length === 0) return;
+    // Push event handler
+    async function handlePushEvent(payload) {
+      const { commits, repository, ref, installation } = payload;
+      if (!commits || commits.length === 0) return;
 
       // Find workspace from installation
-	      const workspace = await getWorkspaceByInstallation(installation?.id);
-	      if (!workspace) {
-	        console.log(
-	          `[GitHub/Push] No workspace found for installation ${installation?.id}`,
-	        );
-	        return;
-	      }
+      const workspace = await getWorkspaceByInstallation(installation?.id);
+      if (!workspace) {
+        console.log(
+          `[GitHub/Push] No workspace found for installation ${installation?.id}`,
+        );
+        return;
+      }
 
       const isMainBranch =
         ref === "refs/heads/main" || ref === "refs/heads/master";
 
-	      for (const commit of commits) {
-	        const taskRefs = extractAllTaskRefs(commit.message);
-	        if (taskRefs.length === 0) continue;
+      for (const commit of commits) {
+        const taskRefs = extractAllTaskRefs(commit.message);
+        if (taskRefs.length === 0) continue;
 
-	        for (const taskRef of taskRefs) {
-	          // Scope task search to this workspace
-	          const task = await tasksCollection.findOne({
-	            taskRef: taskRef,
-	            workspaceId: workspace._id,
-	          });
-	          if (!task) continue;
+        for (const taskRef of taskRefs) {
+          // Scope task search to this workspace
+          const task = await tasksCollection.findOne({
+            taskRef: taskRef,
+            workspaceId: workspace._id,
+          });
+          if (!task) continue;
 
           const branch = ref.replace("refs/heads/", "");
           // GitHub push payloads often include API URLs; store a human URL for UI.
@@ -362,18 +396,18 @@ async function run() {
 
           const newStatus = isMainBranch ? "done" : "in_progress";
 
-	          await tasksCollection.updateOne(
-	            { taskRef: taskRef, workspaceId: workspace._id },
-	            { $set: { status: newStatus, updatedAt: now() } },
-	          );
-	            await moveTaskToStatusColumn(task, newStatus);
+          await tasksCollection.updateOne(
+            { taskRef: taskRef, workspaceId: workspace._id },
+            { $set: { status: newStatus, updatedAt: now() } },
+          );
+          await moveTaskToStatusColumn(task, newStatus);
 
-	          try {
-	            await activitiesCollection.insertOne({
-	              userId: "",
-	              workspaceId: String(workspace._id),
-	              projectId: String(task.projectId || ""),
-	              taskId: String(task._id),
+          try {
+            await activitiesCollection.insertOne({
+              userId: "",
+              workspaceId: String(workspace._id),
+              projectId: String(task.projectId || ""),
+              taskId: String(task._id),
               action: "github_commit_pushed",
               text: `Commit pushed to ${isMainBranch ? "main" : branch} by @${githubUser}: "${commit.message}"`,
               meta: {
@@ -384,22 +418,22 @@ async function run() {
                 repositoryName: repository.full_name,
                 branch,
                 githubUsername: githubUser,
-	              },
-	              createdAt: now(),
-	            });
-	          } catch (err) {
-	            console.error("[GitHub/Push] Activity insert failed:", err.message);
-	          }
+              },
+              createdAt: now(),
+            });
+          } catch (err) {
+            console.error("[GitHub/Push] Activity insert failed:", err.message);
+          }
 
-	          const assigneeUserId = getMemberUserId(workspace, task.assigneeId);
-	          if (assigneeUserId) {
-	            await createNotification({
-	              userId: assigneeUserId,
-	              text: `Commit pushed to ${branch} for "${task.title}"`,
-	              type: "github_commit",
-	              data: { taskId: String(task._id), taskRef, commitUrl },
-	            });
-	          }
+          const assigneeUserId = getMemberUserId(workspace, task.assigneeId);
+          if (assigneeUserId) {
+            await createNotification({
+              userId: assigneeUserId,
+              text: `Commit pushed to ${branch} for "${task.title}"`,
+              type: "github_commit",
+              data: { taskId: String(task._id), taskRef, commitUrl },
+            });
+          }
 
           console.log(
             `[GitHub/Push] Commit ${commit.id.slice(0, 7)} → task ${taskRef}`,
@@ -468,6 +502,7 @@ async function run() {
       website: u?.website || "",
       avatarUrl: u?.avatarUrl || "",
       bio: u?.bio || "",
+      starredWorkspaceIds: Array.isArray(u?.starredWorkspaceIds) ? u.starredWorkspaceIds : [],
     });
 
     const isWorkspaceMember = (workspace, me) => {
@@ -574,6 +609,12 @@ async function run() {
       return String(member?.userId || "");
     };
 
+    const mapTaskReporter = (task) => ({
+      reporterId: String(task?.reporterId || ""),
+      reporterName: String(task?.reporterName || ""),
+      reporterEmail: String(task?.reporterEmail || ""),
+    });
+
     // ---- Status notification helpers ----
     const normalizeStatusKey = (value) =>
       String(value || "")
@@ -601,6 +642,898 @@ async function run() {
       recipients.delete(String(actorUserId || ""));
       return [...recipients];
     };
+
+    const checkoutSessionSchema = z
+      .object({
+        planId: z.enum(["starter", "team", "studio"]),
+        billingCycle: z.enum(["monthly", "yearly"]),
+      })
+      .strict();
+    const billingRequestSchema = z.object({}).strict();
+
+    const BILLING_ALLOWED_ACCESS_STATUSES = new Set(["active", "trialing"]);
+    const BILLING_TERMINAL_STATUSES = new Set([
+      "canceled",
+      "incomplete_expired",
+    ]);
+
+    let stripeClient = null;
+
+    const cleanEnvValue = (value) =>
+      String(value || "")
+        .trim()
+        .replace(/^['"]+|['"]+$/g, "");
+
+    const createBillingHttpError = (status, code, message, details) => {
+      const error = new Error(message);
+      error.status = status;
+      error.code = code;
+      if (details !== undefined) error.details = details;
+      return error;
+    };
+
+    const sendBillingError = (res, error, fallbackMessage) => {
+      const status = Number(error?.status || 500);
+      const message =
+        error?.message ||
+        fallbackMessage ||
+        "The billing request could not be completed";
+      const payload = {
+        error: message,
+        code: error?.code || "BILLING_ERROR",
+      };
+      if (error?.details !== undefined) {
+        payload.details = error.details;
+      }
+      return res.status(status).json(payload);
+    };
+
+    const pickDefined = (value) =>
+      Object.fromEntries(
+        Object.entries(value || {}).filter(([, entry]) => entry !== undefined),
+      );
+
+    const getStripeId = (value) => {
+      if (!value) return "";
+      if (typeof value === "string") return value;
+      if (typeof value?.id === "string") return value.id;
+      return "";
+    };
+
+    const toIsoFromUnix = (value) => {
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric) || numeric <= 0) return null;
+      return new Date(numeric * 1000).toISOString();
+    };
+
+    const getAppBaseUrl = () =>
+      cleanEnvValue(process.env.APP_URL || process.env.FRONTEND_URL) ||
+      "http://localhost:3000";
+
+    const buildAppUrl = (pathname, params = {}) => {
+      const url = new URL(pathname, getAppBaseUrl());
+      for (const [key, value] of Object.entries(params)) {
+        if (value === undefined || value === null || String(value) === "") {
+          continue;
+        }
+        url.searchParams.set(key, String(value));
+      }
+      return url.toString();
+    };
+
+    const buildCheckoutSuccessUrl = () => {
+      const placeholder = "{CHECKOUT_SESSION_ID}";
+      return buildAppUrl("/pricing", {
+        checkout: "success",
+        session_id: placeholder,
+      }).replace(encodeURIComponent(placeholder), placeholder);
+    };
+
+    const buildBillingReturnUrl = () => buildAppUrl("/pricing");
+
+    const getStripeClient = () => {
+      const secretKey = cleanEnvValue(process.env.STRIPE_SECRET_KEY);
+      if (!secretKey) {
+        throw createBillingHttpError(
+          500,
+          "STRIPE_NOT_CONFIGURED",
+          "Stripe is not configured on the server",
+        );
+      }
+
+      if (!stripeClient) {
+        stripeClient = new Stripe(secretKey);
+      }
+
+      return stripeClient;
+    };
+
+    const getStripePriceMap = () => ({
+      starter: {
+        monthly: cleanEnvValue(process.env.STRIPE_PRICE_STARTER_MONTHLY),
+        yearly: cleanEnvValue(process.env.STRIPE_PRICE_STARTER_YEARLY),
+      },
+      team: {
+        monthly: cleanEnvValue(process.env.STRIPE_PRICE_TEAM_MONTHLY),
+        yearly: cleanEnvValue(process.env.STRIPE_PRICE_TEAM_YEARLY),
+      },
+    });
+
+    const getStripePriceId = (planId, billingCycle) => {
+      const planPricing = getStripePriceMap()?.[planId];
+      const priceId = planPricing?.[billingCycle];
+      if (!priceId) {
+        throw createBillingHttpError(
+          500,
+          "PRICE_NOT_CONFIGURED",
+          `Stripe price is not configured for ${planId} ${billingCycle}`,
+        );
+      }
+      return priceId;
+    };
+
+    const getPlanByPriceId = (priceId) => {
+      if (!priceId) return null;
+      const priceMap = getStripePriceMap();
+
+      for (const [planId, cycles] of Object.entries(priceMap)) {
+        for (const [billingCycle, configuredPriceId] of Object.entries(
+          cycles,
+        )) {
+          if (configuredPriceId && configuredPriceId === priceId) {
+            return { planId, billingCycle };
+          }
+        }
+      }
+
+      return null;
+    };
+
+    const getBillingActor = async (req) => {
+      const identity = getUserIdentity(req);
+      const userDoc = await findAuthUserDoc(identity);
+      return {
+        id: String(userDoc?._id || identity.id || ""),
+        email: normalizeEmail(userDoc?.email || identity.email || ""),
+        name: userDoc?.name || identity.name || "User",
+      };
+    };
+
+    const getBillingOwnerType = (value, fallback = "workspace") => {
+      const ownerType = String(value || "")
+        .trim()
+        .toLowerCase();
+      return ownerType || fallback;
+    };
+
+    const getBillingOwnerFromUser = (me) => {
+      const userId = String(me?.id || "").trim();
+      if (!userId) {
+        throw createBillingHttpError(
+          401,
+          "UNAUTHORIZED",
+          "Unable to resolve the authenticated user",
+        );
+      }
+
+      return {
+        type: "user",
+        id: userId,
+        billingContactUserId: userId,
+        billingContactName: String(me?.name || "User").trim() || "User",
+        email: normalizeEmail(me?.email),
+      };
+    };
+
+    const getBillingOwnerFromDoc = (billingDoc) => {
+      if (!billingDoc) return null;
+      const ownerType = getBillingOwnerType(
+        billingDoc.ownerType,
+        billingDoc.workspaceId ? "workspace" : "user",
+      );
+      const ownerId = String(
+        billingDoc.ownerId ||
+          (ownerType === "user"
+            ? billingDoc.billingContactUserId
+            : billingDoc.workspaceId) ||
+          billingDoc.workspaceId ||
+          "",
+      ).trim();
+      if (!ownerId) return null;
+
+      return {
+        type: ownerType,
+        id: ownerId,
+        workspaceId:
+          ownerType === "workspace"
+            ? String(billingDoc.workspaceId || ownerId).trim()
+            : "",
+        workspaceName:
+          ownerType === "workspace"
+            ? String(billingDoc.workspaceName || "").trim()
+            : "",
+        billingContactUserId: String(
+          billingDoc.billingContactUserId ||
+            (ownerType === "user" ? ownerId : ""),
+        ).trim(),
+        billingContactName: String(
+          billingDoc.billingContactName || "User",
+        ).trim(),
+        email: normalizeEmail(billingDoc.billingEmail || ""),
+      };
+    };
+
+    const getBillingOwnerFromMetadata = (metadata = {}) => {
+      const workspaceId = String(
+        metadata.workspaceId || metadata.workspace_id || "",
+      ).trim();
+      const ownerType = getBillingOwnerType(
+        metadata.ownerType || metadata.owner_type,
+        workspaceId ? "workspace" : "user",
+      );
+      const ownerId = String(
+        metadata.ownerId ||
+          metadata.owner_id ||
+          (ownerType === "user"
+            ? metadata.billingContactUserId ||
+              metadata.billing_contact_user_id
+            : workspaceId) ||
+          workspaceId ||
+          "",
+      ).trim();
+
+      if (!ownerId) return null;
+
+      return {
+        type: ownerType,
+        id: ownerId,
+        workspaceId: ownerType === "workspace" ? workspaceId || ownerId : "",
+        workspaceName: String(
+          metadata.workspaceName || metadata.workspace_name || "",
+        ).trim(),
+        billingContactUserId: String(
+          metadata.billingContactUserId ||
+            metadata.billing_contact_user_id ||
+            (ownerType === "user" ? ownerId : "") ||
+            "",
+        ).trim(),
+        billingContactName: String(
+          metadata.billingContactName ||
+            metadata.billing_contact_name ||
+            "User",
+        ).trim(),
+        email: normalizeEmail(
+          metadata.billingEmail || metadata.billing_email || "",
+        ),
+      };
+    };
+
+    const buildBillingOwnerMetadata = (owner) =>
+      pickDefined({
+        ownerType: owner.type,
+        ownerId: owner.id,
+        workspaceId:
+          owner.type === "workspace" ? owner.workspaceId || undefined : undefined,
+        workspaceName:
+          owner.type === "workspace"
+            ? owner.workspaceName || undefined
+            : undefined,
+        billingContactUserId:
+          owner.billingContactUserId ||
+          (owner.type === "user" ? owner.id : undefined),
+        billingContactName: owner.billingContactName || undefined,
+        billingEmail: owner.email || undefined,
+      });
+
+    const getBillingAccountByOwner = async (owner) =>
+      billingAccountsCollection.findOne({
+        ownerType: owner.type,
+        ownerId: owner.id,
+      });
+
+    const upsertBillingAccount = async (owner, updates = {}) => {
+      const timestamp = now();
+      await billingAccountsCollection.updateOne(
+        {
+          ownerType: owner.type,
+          ownerId: owner.id,
+        },
+        {
+          $setOnInsert: {
+            ownerType: owner.type,
+            ownerId: owner.id,
+            createdAt: timestamp,
+          },
+          $set: pickDefined({
+            workspaceId: owner.workspaceId || undefined,
+            workspaceName: owner.workspaceName || undefined,
+            billingContactUserId: owner.billingContactUserId || undefined,
+            billingContactName: owner.billingContactName || undefined,
+            billingEmail: owner.email || undefined,
+            updatedAt: timestamp,
+            ...updates,
+          }),
+        },
+        { upsert: true },
+      );
+
+      return getBillingAccountByOwner(owner);
+    };
+
+    const isSubscriptionAccessAllowed = (status) =>
+      BILLING_ALLOWED_ACCESS_STATUSES.has(String(status || "").toLowerCase());
+
+    const normalizeAccessState = (status) =>
+      isSubscriptionAccessAllowed(status) ? "allowed" : "restricted";
+
+    const mapSubscriptionResponse = ({ owner, billingDoc }) => {
+      const status = String(billingDoc?.status || "inactive");
+      return {
+        owner: {
+          type: owner.type,
+          id: owner.id,
+          billingContactUserId:
+            owner.billingContactUserId ||
+            (owner.type === "user" ? owner.id : ""),
+          billingContactName: owner.billingContactName || "User",
+          billingEmail: owner.email || billingDoc?.billingEmail || "",
+        },
+        subscription: {
+          planId: billingDoc?.planId || null,
+          billingCycle: billingDoc?.billingCycle || null,
+          status,
+          access: normalizeAccessState(status),
+          hasAccess: isSubscriptionAccessAllowed(status),
+          cancelAtPeriodEnd: !!billingDoc?.cancelAtPeriodEnd,
+          currentPeriodStart: billingDoc?.currentPeriodStart || null,
+          currentPeriodEnd: billingDoc?.currentPeriodEnd || null,
+          portalAvailable: !!billingDoc?.stripeCustomerId,
+          stripeManaged: !!billingDoc?.stripeCustomerId,
+          lastInvoiceId: billingDoc?.lastInvoiceId || null,
+          updatedAt: billingDoc?.updatedAt || null,
+        },
+      };
+    };
+
+    const ensureCheckoutAllowed = (billingDoc, owner) => {
+      if (!billingDoc?.stripeSubscriptionId) return;
+
+      const existingStatus = String(billingDoc.status || "").toLowerCase();
+      if (BILLING_TERMINAL_STATUSES.has(existingStatus)) return;
+
+      throw createBillingHttpError(
+        409,
+        "SUBSCRIPTION_EXISTS",
+        "This account already has a Stripe subscription. Use the billing portal to manage it instead.",
+        mapSubscriptionResponse({ owner, billingDoc }).subscription,
+      );
+    };
+
+    const ensureStripeCustomer = async ({ owner }) => {
+      const stripe = getStripeClient();
+      const existingBilling = await getBillingAccountByOwner(owner);
+
+      if (existingBilling?.stripeCustomerId) {
+        try {
+          const existingCustomer = await stripe.customers.retrieve(
+            existingBilling.stripeCustomerId,
+          );
+          if (existingCustomer && !existingCustomer.deleted) {
+            return existingCustomer;
+          }
+        } catch (error) {
+          console.error(
+            "[Billing] Failed to retrieve existing Stripe customer:",
+            error?.message || error,
+          );
+        }
+      }
+
+      if (owner.email) {
+        const matches = await stripe.customers.list({
+          email: owner.email,
+          limit: 20,
+        });
+        const matchedCustomer = matches.data.find(
+          (customer) =>
+            !customer.deleted &&
+            String(customer.metadata?.ownerType || "") === owner.type &&
+            String(customer.metadata?.ownerId || "") === owner.id,
+        );
+
+        if (matchedCustomer) {
+          await upsertBillingAccount(owner, {
+            stripeCustomerId: matchedCustomer.id,
+          });
+          return matchedCustomer;
+        }
+      }
+
+      const customer = await stripe.customers.create(
+        pickDefined({
+          email: owner.email || undefined,
+          name: owner.billingContactName || owner.workspaceName || undefined,
+          metadata: buildBillingOwnerMetadata(owner),
+        }),
+      );
+
+      await upsertBillingAccount(owner, {
+        stripeCustomerId: customer.id,
+      });
+
+      return customer;
+    };
+
+    const buildCheckoutMetadata = ({ owner, planId, billingCycle }) =>
+      pickDefined({
+        ...buildBillingOwnerMetadata(owner),
+        planId,
+        billingCycle,
+      });
+
+    const getBillingAccountForStripeObject = async ({
+      owner,
+      stripeCustomerId,
+      stripeSubscriptionId,
+    }) => {
+      if (owner?.id) {
+        const byOwner = await getBillingAccountByOwner(owner);
+        if (byOwner) return byOwner;
+      }
+
+      if (stripeSubscriptionId) {
+        const bySubscription = await billingAccountsCollection.findOne({
+          stripeSubscriptionId,
+        });
+        if (bySubscription) return bySubscription;
+      }
+
+      if (stripeCustomerId) {
+        return billingAccountsCollection.findOne({ stripeCustomerId });
+      }
+
+      return null;
+    };
+
+    const getSubscriptionSnapshot = (subscription) => {
+      const priceId = String(
+        subscription?.items?.data?.[0]?.price?.id || "",
+      ).trim();
+      const mappedPlan = getPlanByPriceId(priceId);
+      const metadataPlanId = String(
+        subscription?.metadata?.planId || "",
+      ).trim();
+      const metadataBillingCycle = String(
+        subscription?.metadata?.billingCycle || "",
+      ).trim();
+
+      return pickDefined({
+        stripeCustomerId: getStripeId(subscription?.customer) || undefined,
+        stripeSubscriptionId: getStripeId(subscription) || undefined,
+        stripePriceId: priceId || undefined,
+        planId: mappedPlan?.planId || metadataPlanId || undefined,
+        billingCycle:
+          mappedPlan?.billingCycle || metadataBillingCycle || undefined,
+        status: String(subscription?.status || "").trim() || undefined,
+        currentPeriodStart: toIsoFromUnix(subscription?.current_period_start),
+        currentPeriodEnd: toIsoFromUnix(subscription?.current_period_end),
+        cancelAtPeriodEnd: !!subscription?.cancel_at_period_end,
+        lastInvoiceId: getStripeId(subscription?.latest_invoice) || undefined,
+      });
+    };
+
+    const syncCheckoutSessionToBilling = async (session, event) => {
+      if (String(session?.mode || "") !== "subscription") return false;
+
+      const ownerFromMetadata = getBillingOwnerFromMetadata(session?.metadata);
+      const billingDoc = await getBillingAccountForStripeObject({
+        owner: ownerFromMetadata,
+        stripeCustomerId: getStripeId(session?.customer),
+        stripeSubscriptionId: getStripeId(session?.subscription),
+      });
+      const owner = ownerFromMetadata || getBillingOwnerFromDoc(billingDoc);
+
+      if (!owner?.id) {
+        console.warn(
+          `[Billing] Unable to map checkout session ${session?.id} to a billing owner`,
+        );
+        return false;
+      }
+
+      await upsertBillingAccount(
+        {
+          ...owner,
+          email:
+            owner.email ||
+            normalizeEmail(
+              session?.customer_details?.email || billingDoc?.billingEmail,
+            ),
+        },
+        pickDefined({
+          stripeCustomerId: getStripeId(session?.customer) || undefined,
+          stripeSubscriptionId: getStripeId(session?.subscription) || undefined,
+          planId: String(session?.metadata?.planId || "").trim() || undefined,
+          billingCycle:
+            String(session?.metadata?.billingCycle || "").trim() || undefined,
+          lastCheckoutSessionId: String(session?.id || "").trim() || undefined,
+          checkoutCompletedAt: toIsoFromUnix(session?.created),
+          lastEventId: event.id,
+          lastEventType: event.type,
+          lastWebhookAt: now(),
+        }),
+      );
+
+      return true;
+    };
+
+    const syncSubscriptionToBilling = async (subscription, event) => {
+      const ownerFromMetadata = getBillingOwnerFromMetadata(
+        subscription?.metadata,
+      );
+      const billingDoc = await getBillingAccountForStripeObject({
+        owner: ownerFromMetadata,
+        stripeCustomerId: getStripeId(subscription?.customer),
+        stripeSubscriptionId: getStripeId(subscription),
+      });
+      const owner = ownerFromMetadata || getBillingOwnerFromDoc(billingDoc);
+
+      if (!owner?.id) {
+        console.warn(
+          `[Billing] Unable to map subscription ${subscription?.id} to a billing owner`,
+        );
+        return false;
+      }
+
+      await upsertBillingAccount(owner, {
+        ...getSubscriptionSnapshot(subscription),
+        lastEventId: event.id,
+        lastEventType: event.type,
+        lastWebhookAt: now(),
+      });
+
+      return true;
+    };
+
+    const syncInvoiceToBilling = async (invoice, event) => {
+      const billingDoc = await getBillingAccountForStripeObject({
+        stripeCustomerId: getStripeId(invoice?.customer),
+        stripeSubscriptionId: getStripeId(invoice?.subscription),
+      });
+      const owner = getBillingOwnerFromDoc(billingDoc);
+
+      if (!owner?.id) {
+        console.warn(
+          `[Billing] Unable to map invoice ${invoice?.id} to a billing owner`,
+        );
+        return false;
+      }
+
+      const isPaidEvent = event.type === "invoice.paid";
+      const existingStatus = String(billingDoc?.status || "").toLowerCase();
+      const nextStatus = isPaidEvent
+        ? isSubscriptionAccessAllowed(existingStatus)
+          ? undefined
+          : "active"
+        : BILLING_TERMINAL_STATUSES.has(existingStatus)
+          ? undefined
+          : "past_due";
+
+      await upsertBillingAccount(owner, {
+        stripeCustomerId: getStripeId(invoice?.customer) || undefined,
+        stripeSubscriptionId: getStripeId(invoice?.subscription) || undefined,
+        lastInvoiceId: String(invoice?.id || "").trim() || undefined,
+        lastInvoiceStatus: isPaidEvent ? "paid" : "payment_failed",
+        status: nextStatus,
+        lastEventId: event.id,
+        lastEventType: event.type,
+        lastWebhookAt: now(),
+      });
+
+      return true;
+    };
+
+    const registerWebhookEvent = async (event) => {
+      try {
+        await billingEventsCollection.insertOne({
+          eventId: event.id,
+          type: event.type,
+          receivedAt: now(),
+          createdAt: toIsoFromUnix(event.created) || now(),
+        });
+        return { alreadyProcessed: false };
+      } catch (error) {
+        if (error?.code === 11000) {
+          const existing = await billingEventsCollection.findOne({
+            eventId: event.id,
+          });
+          return { alreadyProcessed: !!existing?.processedAt };
+        }
+        throw error;
+      }
+    };
+
+    const markWebhookEventProcessed = async (event, handled) => {
+      await billingEventsCollection.updateOne(
+        { eventId: event.id },
+        {
+          $set: {
+            processedAt: now(),
+            handled: !!handled,
+            processingError: null,
+          },
+        },
+      );
+    };
+
+    const markWebhookEventFailed = async (event, error) => {
+      await billingEventsCollection.updateOne(
+        { eventId: event.id },
+        {
+          $set: {
+            processingError: String(error?.message || error),
+            lastFailedAt: now(),
+          },
+        },
+      );
+    };
+
+    // billing api
+    app.get("/api/billing/subscription", verifyToken, async (req, res) => {
+      try {
+        const parsedQuery = billingRequestSchema.safeParse(req.query || {});
+        if (!parsedQuery.success) {
+          throw createBillingHttpError(
+            400,
+            "INVALID_QUERY",
+            "Invalid billing query",
+            parsedQuery.error.issues,
+          );
+        }
+
+        const me = await getBillingActor(req);
+        const owner = getBillingOwnerFromUser(me);
+        const billingDoc = await getBillingAccountByOwner(owner);
+
+        return res.json(mapSubscriptionResponse({ owner, billingDoc }));
+      } catch (error) {
+        if (error?.status) {
+          return sendBillingError(res, error);
+        }
+
+        console.error("[Billing] Failed to load subscription:", error);
+        return sendBillingError(
+          res,
+          createBillingHttpError(
+            500,
+            "SUBSCRIPTION_FETCH_FAILED",
+            "Failed to fetch subscription status",
+          ),
+        );
+      }
+    });
+
+    app.post("/api/billing/checkout-session", verifyToken, async (req, res) => {
+      try {
+        const parsedBody = checkoutSessionSchema.safeParse(req.body || {});
+        if (!parsedBody.success) {
+          throw createBillingHttpError(
+            400,
+            "INVALID_BILLING_REQUEST",
+            "Invalid checkout request payload",
+            parsedBody.error.issues,
+          );
+        }
+
+        const { planId, billingCycle } = parsedBody.data;
+        if (planId === "studio") {
+          throw createBillingHttpError(
+            400,
+            "PLAN_NOT_SELF_SERVE",
+            "The studio plan must be handled through contact sales",
+          );
+        }
+
+        const me = await getBillingActor(req);
+        const owner = getBillingOwnerFromUser(me);
+        const existingBilling = await getBillingAccountByOwner(owner);
+        ensureCheckoutAllowed(existingBilling, owner);
+
+        const priceId = getStripePriceId(planId, billingCycle);
+        const customer = await ensureStripeCustomer({ owner });
+        const metadata = buildCheckoutMetadata({
+          owner,
+          planId,
+          billingCycle,
+        });
+
+        const stripe = getStripeClient();
+        const session = await stripe.checkout.sessions.create({
+          mode: "subscription",
+          customer: customer?.id || undefined,
+          customer_email: customer?.id ? undefined : owner.email || undefined,
+          client_reference_id: owner.id,
+          success_url: buildCheckoutSuccessUrl(),
+          cancel_url: buildAppUrl("/pricing", {
+            checkout: "cancelled",
+          }),
+          metadata,
+          subscription_data: {
+            metadata,
+          },
+          line_items: [
+            {
+              price: priceId,
+              quantity: 1,
+            },
+          ],
+          allow_promotion_codes: true,
+        });
+
+        await upsertBillingAccount(owner, {
+          stripeCustomerId: customer?.id || undefined,
+          stripePriceId: priceId,
+          planId,
+          billingCycle,
+          lastCheckoutSessionId: session.id,
+        });
+
+        return res.json({ url: session.url });
+      } catch (error) {
+        if (error?.status) {
+          return sendBillingError(res, error);
+        }
+
+        console.error("[Billing] Failed to create checkout session:", error);
+        return sendBillingError(
+          res,
+          createBillingHttpError(
+            500,
+            "CHECKOUT_SESSION_FAILED",
+            "Failed to create Stripe Checkout session",
+          ),
+        );
+      }
+    });
+
+    app.post("/api/billing/portal-session", verifyToken, async (req, res) => {
+      try {
+        const parsedBody = billingRequestSchema.safeParse(req.body || {});
+        if (!parsedBody.success) {
+          throw createBillingHttpError(
+            400,
+            "INVALID_BILLING_REQUEST",
+            "Invalid billing portal request payload",
+            parsedBody.error.issues,
+          );
+        }
+
+        const me = await getBillingActor(req);
+        const owner = getBillingOwnerFromUser(me);
+        const billingDoc = await getBillingAccountByOwner(owner);
+
+        if (!billingDoc?.stripeCustomerId) {
+          throw createBillingHttpError(
+            404,
+            "BILLING_CUSTOMER_NOT_FOUND",
+            "No Stripe customer exists for this account yet",
+          );
+        }
+
+        const stripe = getStripeClient();
+        const session = await stripe.billingPortal.sessions.create({
+          customer: billingDoc.stripeCustomerId,
+          return_url: buildBillingReturnUrl(),
+        });
+
+        await upsertBillingAccount(owner, {
+          lastPortalSessionAt: now(),
+        });
+
+        return res.json({ url: session.url });
+      } catch (error) {
+        if (error?.status) {
+          return sendBillingError(res, error);
+        }
+
+        console.error("[Billing] Failed to create portal session:", error);
+        return sendBillingError(
+          res,
+          createBillingHttpError(
+            500,
+            "PORTAL_SESSION_FAILED",
+            "Failed to create Stripe Billing Portal session",
+          ),
+        );
+      }
+    });
+
+    app.post("/api/billing/webhook", async (req, res) => {
+      let stripe;
+      try {
+        stripe = getStripeClient();
+      } catch (error) {
+        return sendBillingError(res, error);
+      }
+
+      const webhookSecret = cleanEnvValue(process.env.STRIPE_WEBHOOK_SECRET);
+
+      if (!webhookSecret) {
+        console.error("[Billing] Missing STRIPE_WEBHOOK_SECRET");
+        return res.status(500).json({
+          error: "Stripe webhook secret is not configured",
+          code: "STRIPE_WEBHOOK_NOT_CONFIGURED",
+        });
+      }
+
+      const signature = String(req.headers["stripe-signature"] || "");
+      if (!signature) {
+        return res.status(400).json({
+          error: "Missing Stripe signature",
+          code: "MISSING_STRIPE_SIGNATURE",
+        });
+      }
+
+      if (!Buffer.isBuffer(req.rawBody)) {
+        return res.status(400).json({
+          error: "Stripe webhook raw body is missing",
+          code: "MISSING_WEBHOOK_PAYLOAD",
+        });
+      }
+
+      let event;
+      try {
+        event = stripe.webhooks.constructEvent(
+          req.rawBody,
+          signature,
+          webhookSecret,
+        );
+      } catch (error) {
+        console.error("[Billing] Invalid Stripe webhook signature:", error);
+        return res.status(400).json({
+          error: "Invalid Stripe webhook signature",
+          code: "INVALID_STRIPE_SIGNATURE",
+        });
+      }
+
+      try {
+        const registration = await registerWebhookEvent(event);
+        if (registration.alreadyProcessed) {
+          return res.json({ received: true, duplicate: true });
+        }
+
+        let handled = true;
+        switch (event.type) {
+          case "checkout.session.completed":
+            handled = await syncCheckoutSessionToBilling(
+              event.data.object,
+              event,
+            );
+            break;
+          case "customer.subscription.created":
+          case "customer.subscription.updated":
+          case "customer.subscription.deleted":
+            handled = await syncSubscriptionToBilling(event.data.object, event);
+            break;
+          case "invoice.paid":
+          case "invoice.payment_failed":
+            handled = await syncInvoiceToBilling(event.data.object, event);
+            break;
+          default:
+            handled = false;
+            break;
+        }
+
+        await markWebhookEventProcessed(event, handled);
+        return res.json({ received: true, handled });
+      } catch (error) {
+        console.error("[Billing] Webhook processing failed:", error);
+        await markWebhookEventFailed(event, error);
+        return res.status(500).json({
+          error: "Stripe webhook processing failed",
+          code: "WEBHOOK_PROCESSING_FAILED",
+        });
+      }
+    });
 
     app.post("/auth/register", async (req, res) => {
       try {
@@ -671,7 +1604,7 @@ async function run() {
     const LOCK_TIME = 30 * 1000;
 
     app.post("/auth/login", async (req, res) => {
-      console.log("POST /auth/login hit", req.body);
+      // console.log("POST /auth/login hit", req.body);
       try {
         const { email, password } = req.body;
 
@@ -784,6 +1717,10 @@ async function run() {
         }
       }
 
+      if (Array.isArray(patch.starredWorkspaceIds)) {
+        $set.starredWorkspaceIds = patch.starredWorkspaceIds.map(String);
+      }
+
       await usersCollection.updateOne({ _id: userDoc._id }, { $set });
 
       const updated = await usersCollection.findOne({ _id: userDoc._id });
@@ -792,6 +1729,7 @@ async function run() {
         currentUser: mapUserProfile(updated),
       });
     });
+
 
     // GET /dashboard/bootstrap
     app.get("/dashboard/bootstrap", verifyToken, async (req, res) => {
@@ -880,6 +1818,7 @@ async function run() {
           dueDate: t.dueDate || "",
           assigneeId: t.assigneeId || "",
           assigneeName: t.assigneeName || "Unassigned",
+          ...mapTaskReporter(t),
           createdAt: t.createdAt,
           updatedAt: t.updatedAt || "",
           estimatedTime: Number(t.estimatedTime || 0),
@@ -1382,6 +2321,9 @@ async function run() {
         dueDate,
         assigneeId: assignee?.id || "",
         assigneeName: assignee?.name || "Unassigned",
+        reporterId: String(me.id || ""),
+        reporterName: String(me.name || me.email || "User"),
+        reporterEmail: String(me.email || ""),
         estimatedTime: safeEstimatedTime,
         totalTimeSpent: 0,
         remainingTime: safeEstimatedTime,
@@ -1439,6 +2381,7 @@ async function run() {
           dueDate: task.dueDate,
           assigneeId: task.assigneeId,
           assigneeName: task.assigneeName,
+          ...mapTaskReporter(task),
           estimatedTime: task.estimatedTime,
           totalTimeSpent: task.totalTimeSpent,
           remainingTime: task.remainingTime,
@@ -1600,6 +2543,7 @@ async function run() {
             dueDate: t.dueDate || "",
             assigneeId: t.assigneeId || "",
             assigneeName: t.assigneeName || "Unassigned",
+            ...mapTaskReporter(t),
             createdAt: t.createdAt,
             updatedAt: t.updatedAt || "",
             estimatedTime: Number(t.estimatedTime || 0),
@@ -1943,6 +2887,7 @@ async function run() {
                     dueDate: t.dueDate || "",
                     assigneeId: t.assigneeId || "",
                     assigneeName: t.assigneeName || "Unassigned",
+                    ...mapTaskReporter(t),
                     createdAt: t.createdAt,
                     updatedAt: t.updatedAt || "",
                     estimatedTime: Number(t.estimatedTime || 0),
@@ -2161,6 +3106,7 @@ async function run() {
           dueDate: t.dueDate || "",
           assigneeId: t.assigneeId || "",
           assigneeName: t.assigneeName || "Unassigned",
+          ...mapTaskReporter(t),
           createdAt: t.createdAt,
           updatedAt: t.updatedAt || "",
           estimatedTime: Number(t.estimatedTime || 0),
@@ -3422,36 +4368,36 @@ async function run() {
 
     // Github WebHook ----------> Rifat Start
 
-		    app.post("/github/webhook", async (req, res) => {
-		      // Verify signature
-		      if (!verifyGithubWebhookSignature(req)) {
-		        return res.status(401).json({ error: "Invalid signature" });
-		      }
+    app.post("/github/webhook", async (req, res) => {
+      // Verify signature
+      if (!verifyGithubWebhookSignature(req)) {
+        return res.status(401).json({ error: "Invalid signature" });
+      }
 
-		      const githubEventType = req.headers["x-github-event"];
-		      if (!githubEventType)
-		        return res.status(400).json({ error: "Missing x-github-event header" });
+      const githubEventType = req.headers["x-github-event"];
+      if (!githubEventType)
+        return res.status(400).json({ error: "Missing x-github-event header" });
 
-	      const eventHandler = githubEventHandlers[githubEventType];
-	      if (!eventHandler)
-	        return res
-	          .status(200)
-	          .json({ message: `Event "${githubEventType}" not handled` });
+      const eventHandler = githubEventHandlers[githubEventType];
+      if (!eventHandler)
+        return res
+          .status(200)
+          .json({ message: `Event "${githubEventType}" not handled` });
 
-		      await eventHandler(req.body);
-		      return res
-		        .status(200)
-		        .json({ message: `Event "${githubEventType}" processed` });
-		    });
+      await eventHandler(req.body);
+      return res
+        .status(200)
+        .json({ message: `Event "${githubEventType}" processed` });
+    });
 
     // GitHub redirects the user back to the app after installation.
     // This must be protected; otherwise anyone could connect an installation to any workspaceId.
-		    app.get("/github/callback", verifyToken, async (req, res) => {
-		      const { installation_id, state } = req.query;
+    app.get("/github/callback", verifyToken, async (req, res) => {
+      const { installation_id, state } = req.query;
 
-		      if (!installation_id) {
-		        return res.status(400).json({ error: "Missing installation_id" });
-		      }
+      if (!installation_id) {
+        return res.status(400).json({ error: "Missing installation_id" });
+      }
 
       // state contains the workspaceId we passed when redirecting to GitHub
       const workspaceId = state;
@@ -3474,18 +4420,18 @@ async function run() {
         return res.status(403).json({ error: "Only admin can connect GitHub" });
       }
 
-		      // Save or update the installation for this workspace
-		      await githubInstallationsCollection.updateOne(
-		        { workspaceId: workspaceId },
-		        {
-		          $set: {
-	            workspaceId: workspaceId,
-	            installationId: String(installation_id),
-	            connectedAt: now(),
-	          },
-		        },
-		        { upsert: true },
-		      );
+      // Save or update the installation for this workspace
+      await githubInstallationsCollection.updateOne(
+        { workspaceId: workspaceId },
+        {
+          $set: {
+            workspaceId: workspaceId,
+            installationId: String(installation_id),
+            connectedAt: now(),
+          },
+        },
+        { upsert: true },
+      );
 
       // Redirect back to the workspace settings page
       return res.redirect(
@@ -3493,10 +4439,10 @@ async function run() {
       );
     });
 
-		    app.get("/dashboard/github/status", verifyToken, async (req, res) => {
-		      const { workspaceId } = req.query;
-		      if (!workspaceId)
-		        return res.status(400).json({ error: "Missing workspaceId" });
+    app.get("/dashboard/github/status", verifyToken, async (req, res) => {
+      const { workspaceId } = req.query;
+      if (!workspaceId)
+        return res.status(400).json({ error: "Missing workspaceId" });
       if (!isValidId(workspaceId))
         return res.status(400).json({ error: "Invalid workspaceId" });
 
@@ -3510,23 +4456,23 @@ async function run() {
         return res.status(403).json({ error: "Forbidden workspace access" });
       }
 
-		      const installation = await githubInstallationsCollection.findOne({
-		        workspaceId,
-		      });
-		      return res.json({
-		        connected: Boolean(installation),
-		        connectedAt: installation?.connectedAt || null,
-	        installationId: installation?.installationId || null,
-	      });
-	    });
+      const installation = await githubInstallationsCollection.findOne({
+        workspaceId,
+      });
+      return res.json({
+        connected: Boolean(installation),
+        connectedAt: installation?.connectedAt || null,
+        installationId: installation?.installationId || null,
+      });
+    });
 
-	    app.delete(
-	      "/dashboard/github/disconnect",
-	      verifyToken,
-		      async (req, res) => {
-		        const { workspaceId } = req.body;
-		        if (!workspaceId)
-		          return res.status(400).json({ error: "Missing workspaceId" });
+    app.delete(
+      "/dashboard/github/disconnect",
+      verifyToken,
+      async (req, res) => {
+        const { workspaceId } = req.body;
+        if (!workspaceId)
+          return res.status(400).json({ error: "Missing workspaceId" });
 
         // Check user is admin of this workspace
         const workspace = await workspacesCollection.findOne({
@@ -3544,20 +4490,20 @@ async function run() {
             .json({ error: "Only admins can disconnect GitHub" });
         }
 
-		        await githubInstallationsCollection.deleteOne({ workspaceId });
+        await githubInstallationsCollection.deleteOne({ workspaceId });
 
-		        return res.json({ success: true });
-		      },
-		    );
+        return res.json({ success: true });
+      },
+    );
 
-		    app.get("/dashboard/tasks/:taskId/activities", async (req, res) => {
-		      const { taskId } = req.params;
-		      const activities = await activitiesCollection
-		        .find({ taskId: taskId, action: { $regex: "^github_" } })
-		        .sort({ createdAt: -1 })
-		        .toArray();
-		      return res.json(activities);
-		    });
+    app.get("/dashboard/tasks/:taskId/activities", async (req, res) => {
+      const { taskId } = req.params;
+      const activities = await activitiesCollection
+        .find({ taskId: taskId, action: { $regex: "^github_" } })
+        .sort({ createdAt: -1 })
+        .toArray();
+      return res.json(activities);
+    });
 
     // Github WebHook ----------> Rifat End
 
@@ -3619,6 +4565,7 @@ async function run() {
         res.status(500).json({ error: "Server error" });
       }
     });
+
     // ------------------------------Lipi end--------------------------------------------
 
     // Send a ping to confirm a successful connection
@@ -3641,11 +4588,11 @@ app.listen(port, () => {
   console.log(`Zyplo is listening on port ${port}`);
 });
 
-if (process.env.NODE_ENV !== "production") {
-  app.listen(port, () => {
-    console.log(`Zyplo is listening on port ${port}`);
-  });
-}
+// if (process.env.NODE_ENV !== "production") {
+//   app.listen(port, () => {
+//     console.log(`Zyplo is listening on port ${port}`);
+//   });
+// }
 
 // module.exports = app;
 // const serverless = require("serverless-http");
