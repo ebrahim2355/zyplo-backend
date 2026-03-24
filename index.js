@@ -502,6 +502,7 @@ async function run() {
       website: u?.website || "",
       avatarUrl: u?.avatarUrl || "",
       bio: u?.bio || "",
+      starredWorkspaceIds: Array.isArray(u?.starredWorkspaceIds) ? u.starredWorkspaceIds : [],
     });
 
     const isWorkspaceMember = (workspace, me) => {
@@ -1716,6 +1717,10 @@ async function run() {
         }
       }
 
+      if (Array.isArray(patch.starredWorkspaceIds)) {
+        $set.starredWorkspaceIds = patch.starredWorkspaceIds.map(String);
+      }
+
       await usersCollection.updateOne({ _id: userDoc._id }, { $set });
 
       const updated = await usersCollection.findOne({ _id: userDoc._id });
@@ -1724,6 +1729,7 @@ async function run() {
         currentUser: mapUserProfile(updated),
       });
     });
+
 
     // GET /dashboard/bootstrap
     app.get("/dashboard/bootstrap", verifyToken, async (req, res) => {
