@@ -83,6 +83,7 @@ async function run() {
     const githubInstallationsCollection = db.collection("githubInstallations");
     const billingAccountsCollection = db.collection("billingAccounts");
     const billingEventsCollection = db.collection("billingWebhookEvents");
+    const subscribersCollection = db.collection("subscribers");
 
     await notificationsCollection.createIndex({ userId: 1, createdAt: -1 });
     await notificationsCollection.createIndex({ userId: 1, read: 1 });
@@ -450,6 +451,13 @@ async function run() {
 
     // --Github Integration END--
 
+    // post subscriber
+    app.post("/subscriber", async (req, res) => {
+      const data = req.body;
+      const result = await subscribersCollection.insertOne(data);
+      res.send(result);
+    });
+
     // Basic Gmail SMTP sender using .env credentials.
     const transporter = nodemailer.createTransport({
       service: "gmail",
@@ -502,7 +510,9 @@ async function run() {
       website: u?.website || "",
       avatarUrl: u?.avatarUrl || "",
       bio: u?.bio || "",
-      starredWorkspaceIds: Array.isArray(u?.starredWorkspaceIds) ? u.starredWorkspaceIds : [],
+      starredWorkspaceIds: Array.isArray(u?.starredWorkspaceIds)
+        ? u.starredWorkspaceIds
+        : [],
     });
 
     const isWorkspaceMember = (workspace, me) => {
@@ -875,8 +885,7 @@ async function run() {
         metadata.ownerId ||
           metadata.owner_id ||
           (ownerType === "user"
-            ? metadata.billingContactUserId ||
-              metadata.billing_contact_user_id
+            ? metadata.billingContactUserId || metadata.billing_contact_user_id
             : workspaceId) ||
           workspaceId ||
           "",
@@ -913,7 +922,9 @@ async function run() {
         ownerType: owner.type,
         ownerId: owner.id,
         workspaceId:
-          owner.type === "workspace" ? owner.workspaceId || undefined : undefined,
+          owner.type === "workspace"
+            ? owner.workspaceId || undefined
+            : undefined,
         workspaceName:
           owner.type === "workspace"
             ? owner.workspaceName || undefined
@@ -1730,7 +1741,6 @@ async function run() {
       });
     });
 
-
     // GET /dashboard/bootstrap
     app.get("/dashboard/bootstrap", verifyToken, async (req, res) => {
       const me = getUserIdentity(req);
@@ -2194,38 +2204,49 @@ async function run() {
       });
     });
 
-
-
-
     // POST /dashboard/tasks
     app.post("/dashboard/tasks", verifyToken, async (req, res) => {
       const me = getUserIdentity(req);
 
-// ==========================================
+      // ==========================================
       // 🤖 AI KICKSTART OVERRIDE (OFFICIAL GROQ SDK)
       // ==========================================
       if (req.body.isAiKickstart) {
         const { projectId } = req.body;
         try {
-          if (!isValidId(projectId)) return res.status(400).json({ error: "Invalid projectId" });
+          if (!isValidId(projectId))
+            return res.status(400).json({ error: "Invalid projectId" });
 
-          const project = await projectsCollection.findOne({ _id: toId(projectId) });
-          if (!project) return res.status(404).json({ error: "Project not found" });
+          const project = await projectsCollection.findOne({
+            _id: toId(projectId),
+          });
+          if (!project)
+            return res.status(404).json({ error: "Project not found" });
 
-          const workspace = await workspacesCollection.findOne({ _id: toId(project.workspaceId) });
-          if (!isWorkspaceMember(workspace, me)) return res.status(403).json({ error: "Forbidden workspace access" });
+          const workspace = await workspacesCollection.findOne({
+            _id: toId(project.workspaceId),
+          });
+          if (!isWorkspaceMember(workspace, me))
+            return res
+              .status(403)
+              .json({ error: "Forbidden workspace access" });
 
-          const board = await boardsCollection.findOne({ projectId: toId(projectId) });
+          const board = await boardsCollection.findOne({
+            projectId: toId(projectId),
+          });
           if (!board) return res.status(404).json({ error: "Board not found" });
 
-          const todoColumn = (board.columns || []).find(c => 
-            c.name.toLowerCase().includes("to do") || c.name.toLowerCase().includes("todo")
+          const todoColumn = (board.columns || []).find(
+            (c) =>
+              c.name.toLowerCase().includes("to do") ||
+              c.name.toLowerCase().includes("todo"),
           );
-          if (!todoColumn) return res.status(400).json({ error: "No To Do column found" });
+          if (!todoColumn)
+            return res.status(400).json({ error: "No To Do column found" });
 
           // --- OFFICIAL GROQ CALL START ---
           const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-          
+
           const prompt = `You are an expert Agile Product Owner. 
           I just created a new software project named: "${project.name}". 
           Create a backlog of 5 essential starter tasks explicitly tailored to the domain of "${project.name}". 
@@ -2249,19 +2270,26 @@ async function run() {
           const completion = await groq.chat.completions.create({
             messages: [
               { role: "system", content: "You output pure JSON." },
-              { role: "user", content: prompt }
+              { role: "user", content: prompt },
             ],
             model: "llama-3.3-70b-versatile", // The latest active model from the docs!
             response_format: { type: "json_object" }, // Forces valid JSON
           });
-          
+
           // Easily parse the guaranteed JSON response
           const aiResponse = JSON.parse(completion.choices[0].message.content);
           const tasksData = aiResponse.tasks;
           // --- OFFICIAL GROQ CALL END ---
 
-          const lastNumberedTask = await tasksCollection.find({ projectId: toId(projectId) }).sort({ taskNumber: -1 }).limit(1).toArray();
-          let nextTaskNumber = lastNumberedTask.length > 0 ? (lastNumberedTask[0].taskNumber || 0) : 0;
+          const lastNumberedTask = await tasksCollection
+            .find({ projectId: toId(projectId) })
+            .sort({ taskNumber: -1 })
+            .limit(1)
+            .toArray();
+          let nextTaskNumber =
+            lastNumberedTask.length > 0
+              ? lastNumberedTask[0].taskNumber || 0
+              : 0;
 
           const newTasks = tasksData.map((t, index) => {
             nextTaskNumber++;
@@ -2296,7 +2324,10 @@ async function run() {
           });
 
           await tasksCollection.insertMany(newTasks);
-          return res.status(201).json({ message: "AI Kickstart complete", tasksAdded: newTasks.length });
+          return res.status(201).json({
+            message: "AI Kickstart complete",
+            tasksAdded: newTasks.length,
+          });
         } catch (error) {
           console.error("AI Kickstart failed:", error);
           return res.status(500).json({ error: "Failed to generate AI tasks" });
@@ -4415,7 +4446,8 @@ async function run() {
           {
             $set: {
               members: (workspace.members || []).map((currentMember) =>
-                String(currentMember.id || currentMember.userId || "") === memberKey
+                String(currentMember.id || currentMember.userId || "") ===
+                memberKey
                   ? { ...currentMember, role: nextRole }
                   : currentMember,
               ),
@@ -4656,100 +4688,95 @@ async function run() {
       }
     });
 
+    // GET ROUTE: Fetch all comments for a specific task
+    app.get("/dashboard/comments/:taskId", async (req, res) => {
+      try {
+        const { taskId } = req.params;
 
-// GET ROUTE: Fetch all comments for a specific task
-app.get('/dashboard/comments/:taskId', async (req, res) => {
-  try {
-    const { taskId } = req.params;
-    
-    const comments = await commentsCollection
-      .find({ taskId: taskId })
-      .sort({ createdAt: -1 })
-      .toArray();
+        const comments = await commentsCollection
+          .find({ taskId: taskId })
+          .sort({ createdAt: -1 })
+          .toArray();
 
-    // ←←← new added
-    const formattedComments = comments.map(comment => ({
-      ...comment,
-      id: comment._id.toString(),  
-      _id: undefined               
-    }));
+        // ←←← new added
+        const formattedComments = comments.map((comment) => ({
+          ...comment,
+          id: comment._id.toString(),
+          _id: undefined,
+        }));
 
-    return res.json(formattedComments);
-  } catch (err) {
-    console.error("GET Comments Error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-    
-    
-    // ===============================================
-// NEW: EDIT COMMENT (PUT)
-// ===============================================
-app.put("/dashboard/:taskId/comments/:commentId", async (req, res) => {
-  try {
-    const { taskId, commentId } = req.params;
-    const { text } = req.body;
-
-    if (!text || text.trim() === "") {
-      return res.status(400).json({ error: "Comment text is required" });
-    }
-
-    const result = await commentsCollection.updateOne(
-      { 
-        _id: new ObjectId(commentId),
-        taskId: taskId  
-      },
-      { 
-        $set: { 
-          text: text.trim(),
-          updatedAt: new Date().toISOString() 
-        } 
+        return res.json(formattedComments);
+      } catch (err) {
+        console.error("GET Comments Error:", err);
+        res.status(500).json({ error: "Server error" });
       }
-    );
-
-    if (result.matchedCount === 0) {
-      return res.status(404).json({ error: "Comment not found" });
-    }
-
-    res.json({ 
-      ok: true, 
-      message: "Comment updated successfully" 
-    });
-  } catch (err) {
-    console.error("PUT Comment Error:", err);
-    res.status(500).json({ error: "Failed to update comment" });
-  }
-});
-
-
-// ===============================================
-// NEW: DELETE COMMENT (DELETE)
-// ===============================================
-app.delete("/dashboard/:taskId/comments/:commentId", async (req, res) => {
-  try {
-    const { taskId, commentId } = req.params;
-
-    const result = await commentsCollection.deleteOne({
-      _id: new ObjectId(commentId),
-      taskId: taskId
     });
 
-    if (result.deletedCount === 0) {
-      return res.status(404).json({ error: "Comment not found" });
-    }
+    // ===============================================
+    // NEW: EDIT COMMENT (PUT)
+    // ===============================================
+    app.put("/dashboard/:taskId/comments/:commentId", async (req, res) => {
+      try {
+        const { taskId, commentId } = req.params;
+        const { text } = req.body;
 
-    res.json({ 
-      ok: true, 
-      message: "Comment deleted successfully" 
+        if (!text || text.trim() === "") {
+          return res.status(400).json({ error: "Comment text is required" });
+        }
+
+        const result = await commentsCollection.updateOne(
+          {
+            _id: new ObjectId(commentId),
+            taskId: taskId,
+          },
+          {
+            $set: {
+              text: text.trim(),
+              updatedAt: new Date().toISOString(),
+            },
+          },
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ error: "Comment not found" });
+        }
+
+        res.json({
+          ok: true,
+          message: "Comment updated successfully",
+        });
+      } catch (err) {
+        console.error("PUT Comment Error:", err);
+        res.status(500).json({ error: "Failed to update comment" });
+      }
     });
-  } catch (err) {
-    console.error("DELETE Comment Error:", err);
-    res.status(500).json({ error: "Failed to delete comment" });
-  }
-});
+
+    // ===============================================
+    // NEW: DELETE COMMENT (DELETE)
+    // ===============================================
+    app.delete("/dashboard/:taskId/comments/:commentId", async (req, res) => {
+      try {
+        const { taskId, commentId } = req.params;
+
+        const result = await commentsCollection.deleteOne({
+          _id: new ObjectId(commentId),
+          taskId: taskId,
+        });
+
+        if (result.deletedCount === 0) {
+          return res.status(404).json({ error: "Comment not found" });
+        }
+
+        res.json({
+          ok: true,
+          message: "Comment deleted successfully",
+        });
+      } catch (err) {
+        console.error("DELETE Comment Error:", err);
+        res.status(500).json({ error: "Failed to delete comment" });
+      }
+    });
     // ------------------------------Lipi end--------------------------------------------
-    
 
     // ------------------------------Lipi end--------------------------------------------
 
