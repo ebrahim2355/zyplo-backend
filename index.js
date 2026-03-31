@@ -4549,22 +4549,100 @@ async function run() {
       }
     });
 
-    // GET ROUTE: Fetch all comments for a specific task
-    app.get("/dashboard/comments/:taskId", async (req, res) => {
-      try {
-        const { taskId } = req.params;
 
-        const comments = await commentsCollection
-          .find({ taskId: taskId })
-          .sort({ createdAt: -1 }) // Newest first
-          .toArray();
+// GET ROUTE: Fetch all comments for a specific task
+app.get('/dashboard/comments/:taskId', async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    
+    const comments = await commentsCollection
+      .find({ taskId: taskId })
+      .sort({ createdAt: -1 })
+      .toArray();
 
-        return res.json(comments);
-      } catch (err) {
-        console.error("GET Comments Error:", err);
-        res.status(500).json({ error: "Server error" });
+    // ←←← new added
+    const formattedComments = comments.map(comment => ({
+      ...comment,
+      id: comment._id.toString(),  
+      _id: undefined               
+    }));
+
+    return res.json(formattedComments);
+  } catch (err) {
+    console.error("GET Comments Error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+    
+    
+    // ===============================================
+// NEW: EDIT COMMENT (PUT)
+// ===============================================
+app.put("/dashboard/:taskId/comments/:commentId", async (req, res) => {
+  try {
+    const { taskId, commentId } = req.params;
+    const { text } = req.body;
+
+    if (!text || text.trim() === "") {
+      return res.status(400).json({ error: "Comment text is required" });
+    }
+
+    const result = await commentsCollection.updateOne(
+      { 
+        _id: new ObjectId(commentId),
+        taskId: taskId  
+      },
+      { 
+        $set: { 
+          text: text.trim(),
+          updatedAt: new Date().toISOString() 
+        } 
       }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ error: "Comment not found" });
+    }
+
+    res.json({ 
+      ok: true, 
+      message: "Comment updated successfully" 
     });
+  } catch (err) {
+    console.error("PUT Comment Error:", err);
+    res.status(500).json({ error: "Failed to update comment" });
+  }
+});
+
+
+// ===============================================
+// NEW: DELETE COMMENT (DELETE)
+// ===============================================
+app.delete("/dashboard/:taskId/comments/:commentId", async (req, res) => {
+  try {
+    const { taskId, commentId } = req.params;
+
+    const result = await commentsCollection.deleteOne({
+      _id: new ObjectId(commentId),
+      taskId: taskId
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ error: "Comment not found" });
+    }
+
+    res.json({ 
+      ok: true, 
+      message: "Comment deleted successfully" 
+    });
+  } catch (err) {
+    console.error("DELETE Comment Error:", err);
+    res.status(500).json({ error: "Failed to delete comment" });
+  }
+});
+    // ------------------------------Lipi end--------------------------------------------
+    
 
     // ------------------------------Lipi end--------------------------------------------
 
