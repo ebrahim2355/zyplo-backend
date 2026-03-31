@@ -1,4 +1,5 @@
 const { setServers } = require("node:dns/promises");
+const { Server } = require("socket.io");
 const cors = require("cors");
 const express = require("express");
 const app = express();
@@ -11,11 +12,25 @@ const nodemailer = require("nodemailer");
 const Stripe = require("stripe");
 const Groq = require("groq-sdk");
 const port = process.env.PORT || 5000;
+// Clean quoted env values before using them as origins.
+const cleanOrigin = (value) =>
+  String(value || "")
+    .trim()
+    .replace(/^["']+|["']+$/g, "");
+// Reuse the same frontend origins for HTTP and Socket.IO.
+const allowedOrigins = [
+  "http://localhost:3000",
+  "https://zyplo-six.vercel.app",
+  cleanOrigin(process.env.FRONTEND_URL),
+].filter(Boolean);
+// Keep one socket server instance for the whole app.
+let io = null;
+
 setServers(["1.1.1.1", "8.8.8.8"]);
 
 app.use(
   cors({
-    origin: ["http://localhost:3000", "https://zyplo-six.vercel.app"],
+    origin: allowedOrigins,
     credentials: true,
   }),
 );
@@ -62,6 +77,57 @@ const inviteSchema = z.object({
   email: z.email(),
   role: z.enum(["admin", "member"]),
 });
+
+// Put all tabs for one user in the same room.
+const getUserRoom = (userId) => `user:${String(userId)}`;
+
+// Keep generic task update notifications for non-status fields only.
+const getGenericTaskUpdateChanges = (patch, existingTask) => {
+  const changed = [];
+
+  if (patch.dueDate !== undefined && patch.dueDate !== existingTask.dueDate)
+    changed.push("due date");
+  if (patch.title && patch.title !== existingTask.title) changed.push("title");
+
+  return changed;
+};
+
+// Attach Socket.IO to the same server used by Express.
+const attachSocketServer = (server) => {
+  io = new Server(server, {
+    cors: {
+      origin: allowedOrigins,
+      credentials: true,
+    },
+  });
+
+  // Verify the socket with the same JWT secret used by HTTP auth.
+  io.use((socket, next) => {
+    const token =
+      socket.handshake.auth?.token ||
+      String(socket.handshake.headers?.authorization || "")
+        .replace(/^Bearer\s+/i, "")
+        .trim();
+
+    if (!token) {
+      return next(new Error("Unauthorized"));
+    }
+
+    try {
+      socket.user = jwt.verify(token, process.env.NEXTAUTH_SECRET);
+      next();
+    } catch (_error) {
+      next(new Error("Unauthorized"));
+    }
+  });
+
+  // Join every connected tab to the user's room.
+  io.on("connection", (socket) => {
+    socket.join(getUserRoom(socket.user.id));
+  });
+
+  return io;
+};
 
 async function run() {
   try {
@@ -540,7 +606,7 @@ async function run() {
     }) => {
       if (!userId || !text) return;
       try {
-        await notificationsCollection.updateOne(
+        const result = await notificationsCollection.updateOne(
           {
             userId: String(userId),
             text: String(text),
@@ -558,6 +624,25 @@ async function run() {
           },
           { upsert: true },
         );
+
+        // Push only new notifications to every open tab for that user.
+        if (result.upsertedId && io) {
+          const notification = await notificationsCollection.findOne({
+            _id: result.upsertedId,
+          });
+
+          if (notification) {
+            io.to(getUserRoom(String(userId))).emit("notification:new", {
+              id: String(notification._id),
+              userId: String(notification.userId),
+              text: notification.text,
+              type: notification.type,
+              data: notification.data,
+              read: notification.read,
+              createdAt: notification.createdAt,
+            });
+          }
+        }
       } catch (e) {
         console.error("Notification insert failed:", e?.message || e);
       }
@@ -3164,14 +3249,8 @@ async function run() {
       if (!t || !t._id)
         return res.status(404).json({ error: "Task not found" });
 
-      const changed = [];
-      if (patch.status && patch.status !== existingTask.status)
-        changed.push(`status -> ${patch.status}`);
-
-      if (patch.dueDate !== undefined && patch.dueDate !== existingTask.dueDate)
-        changed.push("due date");
-      if (patch.title && patch.title !== existingTask.title)
-        changed.push("title");
+      // Build the generic update summary without duplicating status notices.
+      const changed = getGenericTaskUpdateChanges(patch, existingTask);
 
       const newAssigneeId = patch.assigneeId ?? existingTask.assigneeId;
       const assigneeUserId = getMemberUserId(workspace, newAssigneeId);
@@ -3243,6 +3322,14 @@ async function run() {
           { userId: String(me.id), read: false },
           { $set: { read: true } },
         );
+        // Tell every open tab for this user to clear unread notifications.
+        if (io) {
+          io.to(getUserRoom(String(me.id))).emit("notification:read-all", {
+            userId: String(me.id),
+            read: true,
+            readAt: now(),
+          });
+        }
         res.json({ ok: true });
       },
     );
@@ -4763,15 +4850,27 @@ app.delete("/dashboard/:taskId/comments/:commentId", async (req, res) => {
     // await client.close();
   }
 }
-run().catch(console.dir);
 
 app.get("/", (req, res) => {
   res.send("Zyplo server is running!");
 });
 
-app.listen(port, () => {
-  console.log(`Zyplo is listening on port ${port}`);
-});
+if (process.env.NODE_ENV !== "test") {
+  run().catch(console.dir);
+
+  // Start one HTTP server for both REST and Socket.IO.
+  const server = app.listen(port, () => {
+    console.log(`Zyplo is listening on port ${port}`);
+  });
+
+  attachSocketServer(server);
+}
+
+module.exports = {
+  attachSocketServer,
+  getGenericTaskUpdateChanges,
+  getUserRoom,
+};
 
 // if (process.env.NODE_ENV !== "production") {
 //   app.listen(port, () => {
