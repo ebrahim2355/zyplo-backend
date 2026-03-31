@@ -9,8 +9,8 @@ const { z } = require("zod");
 const crypto = require("crypto");
 const nodemailer = require("nodemailer");
 const Stripe = require("stripe");
+const Groq = require("groq-sdk");
 const port = process.env.PORT || 5000;
-
 setServers(["1.1.1.1", "8.8.8.8"]);
 
 app.use(
@@ -2194,8 +2194,116 @@ async function run() {
       });
     });
 
+
+
+
     // POST /dashboard/tasks
     app.post("/dashboard/tasks", verifyToken, async (req, res) => {
+      const me = getUserIdentity(req);
+
+// ==========================================
+      // 🤖 AI KICKSTART OVERRIDE (OFFICIAL GROQ SDK)
+      // ==========================================
+      if (req.body.isAiKickstart) {
+        const { projectId } = req.body;
+        try {
+          if (!isValidId(projectId)) return res.status(400).json({ error: "Invalid projectId" });
+
+          const project = await projectsCollection.findOne({ _id: toId(projectId) });
+          if (!project) return res.status(404).json({ error: "Project not found" });
+
+          const workspace = await workspacesCollection.findOne({ _id: toId(project.workspaceId) });
+          if (!isWorkspaceMember(workspace, me)) return res.status(403).json({ error: "Forbidden workspace access" });
+
+          const board = await boardsCollection.findOne({ projectId: toId(projectId) });
+          if (!board) return res.status(404).json({ error: "Board not found" });
+
+          const todoColumn = (board.columns || []).find(c => 
+            c.name.toLowerCase().includes("to do") || c.name.toLowerCase().includes("todo")
+          );
+          if (!todoColumn) return res.status(400).json({ error: "No To Do column found" });
+
+          // --- OFFICIAL GROQ CALL START ---
+          const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+          
+          const prompt = `You are an expert Agile Product Owner. 
+          I just created a new software project named: "${project.name}". 
+          Create a backlog of 5 essential starter tasks explicitly tailored to the domain of "${project.name}". 
+          
+          CRITICAL RULES:
+          1. Do NOT give me generic tasks like "Setup repository".
+          2. Every task MUST directly relate to the specific technology or business logic implied by the name "${project.name}".
+          3. Return the result as a JSON object containing a "tasks" array.
+          
+          Use this exact JSON schema:
+          {
+            "tasks": [
+              { 
+                "title": "Specific task title related to ${project.name}", 
+                "description": "Detailed technical description.", 
+                "estimatedTime": 3600 
+              }
+            ]
+          }`;
+
+          const completion = await groq.chat.completions.create({
+            messages: [
+              { role: "system", content: "You output pure JSON." },
+              { role: "user", content: prompt }
+            ],
+            model: "llama-3.3-70b-versatile", // The latest active model from the docs!
+            response_format: { type: "json_object" }, // Forces valid JSON
+          });
+          
+          // Easily parse the guaranteed JSON response
+          const aiResponse = JSON.parse(completion.choices[0].message.content);
+          const tasksData = aiResponse.tasks;
+          // --- OFFICIAL GROQ CALL END ---
+
+          const lastNumberedTask = await tasksCollection.find({ projectId: toId(projectId) }).sort({ taskNumber: -1 }).limit(1).toArray();
+          let nextTaskNumber = lastNumberedTask.length > 0 ? (lastNumberedTask[0].taskNumber || 0) : 0;
+
+          const newTasks = tasksData.map((t, index) => {
+            nextTaskNumber++;
+            return {
+              workspaceId: project.workspaceId,
+              projectId: project._id,
+              boardId: board._id,
+              columnId: todoColumn._id,
+              order: index,
+              taskNumber: nextTaskNumber,
+              taskRef: `${project.key}-${nextTaskNumber}`,
+              projectName: project.name,
+              title: t.title,
+              description: t.description,
+              priority: "P2",
+              status: "todo",
+              dueDate: "",
+              assigneeId: "",
+              assigneeName: "Unassigned",
+              reporterId: String(me.id || ""),
+              reporterName: "AI Assistant 🤖",
+              reporterEmail: "",
+              estimatedTime: t.estimatedTime || 3600,
+              totalTimeSpent: 0,
+              remainingTime: t.estimatedTime || 3600,
+              attachments: [],
+              createdAt: now(),
+              updatedAt: now(),
+              assignedByUserId: String(me.id || ""),
+              assignedByName: "AI Assistant 🤖",
+            };
+          });
+
+          await tasksCollection.insertMany(newTasks);
+          return res.status(201).json({ message: "AI Kickstart complete", tasksAdded: newTasks.length });
+        } catch (error) {
+          console.error("AI Kickstart failed:", error);
+          return res.status(500).json({ error: "Failed to generate AI tasks" });
+        }
+      }
+      // ==========================================
+
       const {
         workspaceId,
         projectId = "",
@@ -2234,7 +2342,6 @@ async function run() {
       if (!workspace)
         return res.status(404).json({ error: "Workspace not found" });
 
-      const me = getUserIdentity(req);
       if (!isWorkspaceMember(workspace, me))
         return res.status(403).json({ error: "Forbidden workspace access" });
 
