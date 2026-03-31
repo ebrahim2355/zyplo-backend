@@ -46,7 +46,7 @@ This approach fits the current codebase because the existing API already returns
 
 ### Server bootstrap
 
-Replace the direct `app.listen(...)` startup with an `http.createServer(app)` wrapper and attach a Socket.IO server to that HTTP server. Keep the current Express middleware and routes unchanged unless they need to emit realtime events.
+Obtain the underlying HTTP server used by Express and attach Socket.IO to that server. This can be done either by wrapping the app with `http.createServer(app)` or by capturing the server returned from `app.listen(...)`. Render deployment is unaffected as long as the process still listens on `process.env.PORT`. Keep the current Express middleware and routes unchanged unless they need to emit realtime events.
 
 ### Socket authentication
 
