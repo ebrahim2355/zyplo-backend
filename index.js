@@ -80,6 +80,30 @@ const inviteSchema = z.object({
 
 // Put all tabs for one user in the same room.
 const getUserRoom = (userId) => `user:${String(userId)}`;
+// Group workspace-wide task listeners together.
+const getWorkspaceRoom = (workspaceId) => `workspace:${String(workspaceId)}`;
+// Group board task listeners by project.
+const getProjectRoom = (projectId) => `project:${String(projectId)}`;
+// Broadcast a saved task to the active workspace and project listeners.
+const emitTaskUpsert = (task) => {
+  if (!io || !task?.id) return;
+  if (task.workspaceId) {
+    io.to(getWorkspaceRoom(task.workspaceId)).emit("task:upsert", task);
+  }
+  if (task.projectId) {
+    io.to(getProjectRoom(task.projectId)).emit("task:upsert", task);
+  }
+};
+// Broadcast a deleted task id to the active workspace and project listeners.
+const emitTaskDeleted = (task) => {
+  if (!io || !task?.id) return;
+  if (task.workspaceId) {
+    io.to(getWorkspaceRoom(task.workspaceId)).emit("task:deleted", task);
+  }
+  if (task.projectId) {
+    io.to(getProjectRoom(task.projectId)).emit("task:deleted", task);
+  }
+};
 
 // Keep generic task update notifications for non-status fields only.
 const getGenericTaskUpdateChanges = (patch, existingTask) => {
@@ -124,6 +148,25 @@ const attachSocketServer = (server) => {
   // Join every connected tab to the user's room.
   io.on("connection", (socket) => {
     socket.join(getUserRoom(socket.user.id));
+
+    // Subscribe the active page to workspace and project task rooms.
+    socket.on(
+      "task:subscribe",
+      ({ workspaceId = "", projectId = "" } = {}, done = () => {}) => {
+      if (workspaceId) socket.join(getWorkspaceRoom(workspaceId));
+      if (projectId) socket.join(getProjectRoom(projectId));
+      done();
+    });
+
+    // Leave task rooms when the active page context changes.
+    socket.on(
+      "task:unsubscribe",
+      ({ workspaceId = "", projectId = "" } = {}, done = () => {}) => {
+        if (workspaceId) socket.leave(getWorkspaceRoom(workspaceId));
+        if (projectId) socket.leave(getProjectRoom(projectId));
+        done();
+      },
+    );
   });
 
   return io;
@@ -149,6 +192,7 @@ async function run() {
     const githubInstallationsCollection = db.collection("githubInstallations");
     const billingAccountsCollection = db.collection("billingAccounts");
     const billingEventsCollection = db.collection("billingWebhookEvents");
+    const subscribersCollection = db.collection("subscribers");
 
     await notificationsCollection.createIndex({ userId: 1, createdAt: -1 });
     await notificationsCollection.createIndex({ userId: 1, read: 1 });
@@ -516,6 +560,13 @@ async function run() {
 
     // --Github Integration END--
 
+    // post subscriber
+    app.post("/subscriber", async (req, res) => {
+      const data = req.body;
+      const result = await subscribersCollection.insertOne(data);
+      res.send(result);
+    });
+
     // Basic Gmail SMTP sender using .env credentials.
     const transporter = nodemailer.createTransport({
       service: "gmail",
@@ -568,7 +619,9 @@ async function run() {
       website: u?.website || "",
       avatarUrl: u?.avatarUrl || "",
       bio: u?.bio || "",
-      starredWorkspaceIds: Array.isArray(u?.starredWorkspaceIds) ? u.starredWorkspaceIds : [],
+      starredWorkspaceIds: Array.isArray(u?.starredWorkspaceIds)
+        ? u.starredWorkspaceIds
+        : [],
     });
 
     const isWorkspaceMember = (workspace, me) => {
@@ -698,6 +751,42 @@ async function run() {
       reporterId: String(task?.reporterId || ""),
       reporterName: String(task?.reporterName || ""),
       reporterEmail: String(task?.reporterEmail || ""),
+    });
+
+    // Reuse one task shape for REST responses and live task events.
+    const normalizeTask = (task) => ({
+      id: String(task?._id || task?.id || ""),
+      workspaceId: String(task?.workspaceId || ""),
+      projectId: task?.projectId ? String(task.projectId) : "",
+      boardId: task?.boardId ? String(task.boardId) : "",
+      columnId: task?.columnId ? String(task.columnId) : "",
+      order: Number.isInteger(task?.order) ? task.order : 0,
+      taskNumber: task?.taskNumber || "",
+      taskRef: task?.taskRef || "",
+      projectName: task?.projectName || "",
+      title: task?.title,
+      description: task?.description || "",
+      priority: task?.priority || "P2",
+      status: task?.status || "todo",
+      dueDate: task?.dueDate || "",
+      assigneeId: task?.assigneeId || "",
+      assigneeName: task?.assigneeName || "Unassigned",
+      ...mapTaskReporter(task),
+      createdAt: task?.createdAt,
+      updatedAt: task?.updatedAt || "",
+      estimatedTime: Number(task?.estimatedTime || 0),
+      totalTimeSpent: Number(task?.totalTimeSpent || 0),
+      remainingTime: Math.max(
+        Number(
+          task?.remainingTime !== undefined
+            ? task.remainingTime
+            : Number(task?.estimatedTime || 0) -
+                Number(task?.totalTimeSpent || 0),
+        ),
+        0,
+      ),
+      // Keep file attachments in the live payload too.
+      attachments: task?.attachments || [],
     });
 
     // ---- Status notification helpers ----
@@ -960,8 +1049,7 @@ async function run() {
         metadata.ownerId ||
           metadata.owner_id ||
           (ownerType === "user"
-            ? metadata.billingContactUserId ||
-              metadata.billing_contact_user_id
+            ? metadata.billingContactUserId || metadata.billing_contact_user_id
             : workspaceId) ||
           workspaceId ||
           "",
@@ -998,7 +1086,9 @@ async function run() {
         ownerType: owner.type,
         ownerId: owner.id,
         workspaceId:
-          owner.type === "workspace" ? owner.workspaceId || undefined : undefined,
+          owner.type === "workspace"
+            ? owner.workspaceId || undefined
+            : undefined,
         workspaceName:
           owner.type === "workspace"
             ? owner.workspaceName || undefined
@@ -1815,7 +1905,6 @@ async function run() {
       });
     });
 
-
     // GET /dashboard/bootstrap
     app.get("/dashboard/bootstrap", verifyToken, async (req, res) => {
       const me = getUserIdentity(req);
@@ -2279,38 +2368,49 @@ async function run() {
       });
     });
 
-
-
-
     // POST /dashboard/tasks
     app.post("/dashboard/tasks", verifyToken, async (req, res) => {
       const me = getUserIdentity(req);
 
-// ==========================================
+      // ==========================================
       // 🤖 AI KICKSTART OVERRIDE (OFFICIAL GROQ SDK)
       // ==========================================
       if (req.body.isAiKickstart) {
         const { projectId } = req.body;
         try {
-          if (!isValidId(projectId)) return res.status(400).json({ error: "Invalid projectId" });
+          if (!isValidId(projectId))
+            return res.status(400).json({ error: "Invalid projectId" });
 
-          const project = await projectsCollection.findOne({ _id: toId(projectId) });
-          if (!project) return res.status(404).json({ error: "Project not found" });
+          const project = await projectsCollection.findOne({
+            _id: toId(projectId),
+          });
+          if (!project)
+            return res.status(404).json({ error: "Project not found" });
 
-          const workspace = await workspacesCollection.findOne({ _id: toId(project.workspaceId) });
-          if (!isWorkspaceMember(workspace, me)) return res.status(403).json({ error: "Forbidden workspace access" });
+          const workspace = await workspacesCollection.findOne({
+            _id: toId(project.workspaceId),
+          });
+          if (!isWorkspaceMember(workspace, me))
+            return res
+              .status(403)
+              .json({ error: "Forbidden workspace access" });
 
-          const board = await boardsCollection.findOne({ projectId: toId(projectId) });
+          const board = await boardsCollection.findOne({
+            projectId: toId(projectId),
+          });
           if (!board) return res.status(404).json({ error: "Board not found" });
 
-          const todoColumn = (board.columns || []).find(c => 
-            c.name.toLowerCase().includes("to do") || c.name.toLowerCase().includes("todo")
+          const todoColumn = (board.columns || []).find(
+            (c) =>
+              c.name.toLowerCase().includes("to do") ||
+              c.name.toLowerCase().includes("todo"),
           );
-          if (!todoColumn) return res.status(400).json({ error: "No To Do column found" });
+          if (!todoColumn)
+            return res.status(400).json({ error: "No To Do column found" });
 
           // --- OFFICIAL GROQ CALL START ---
           const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-          
+
           const prompt = `You are an expert Agile Product Owner. 
           I just created a new software project named: "${project.name}". 
           Create a backlog of 5 essential starter tasks explicitly tailored to the domain of "${project.name}". 
@@ -2334,19 +2434,26 @@ async function run() {
           const completion = await groq.chat.completions.create({
             messages: [
               { role: "system", content: "You output pure JSON." },
-              { role: "user", content: prompt }
+              { role: "user", content: prompt },
             ],
             model: "llama-3.3-70b-versatile", // The latest active model from the docs!
             response_format: { type: "json_object" }, // Forces valid JSON
           });
-          
+
           // Easily parse the guaranteed JSON response
           const aiResponse = JSON.parse(completion.choices[0].message.content);
           const tasksData = aiResponse.tasks;
           // --- OFFICIAL GROQ CALL END ---
 
-          const lastNumberedTask = await tasksCollection.find({ projectId: toId(projectId) }).sort({ taskNumber: -1 }).limit(1).toArray();
-          let nextTaskNumber = lastNumberedTask.length > 0 ? (lastNumberedTask[0].taskNumber || 0) : 0;
+          const lastNumberedTask = await tasksCollection
+            .find({ projectId: toId(projectId) })
+            .sort({ taskNumber: -1 })
+            .limit(1)
+            .toArray();
+          let nextTaskNumber =
+            lastNumberedTask.length > 0
+              ? lastNumberedTask[0].taskNumber || 0
+              : 0;
 
           const newTasks = tasksData.map((t, index) => {
             nextTaskNumber++;
@@ -2380,8 +2487,22 @@ async function run() {
             };
           });
 
-          await tasksCollection.insertMany(newTasks);
-          return res.status(201).json({ message: "AI Kickstart complete", tasksAdded: newTasks.length });
+          const aiInsertResult = await tasksCollection.insertMany(newTasks);
+
+          // Sync AI-created tasks to active task views too.
+          Object.values(aiInsertResult.insertedIds || {}).forEach((insertedId, index) => {
+            emitTaskUpsert(
+              normalizeTask({
+                _id: insertedId,
+                ...newTasks[index],
+              }),
+            );
+          });
+
+          return res.status(201).json({
+            message: "AI Kickstart complete",
+            tasksAdded: newTasks.length,
+          });
         } catch (error) {
           console.error("AI Kickstart failed:", error);
           return res.status(500).json({ error: "Failed to generate AI tasks" });
@@ -2553,36 +2674,14 @@ async function run() {
         });
       }
 
-      res.status(201).json({
-        task: {
-          id: String(result.insertedId),
-          workspaceId,
-          projectId: String(task.projectId),
-          boardId: String(task.boardId),
-          columnId: String(task.columnId),
-          // Keep taskRef/taskNumber in the response so the frontend can render
-          // it immediately (and not "lose" it during store merges).
-          taskNumber: task.taskNumber || "",
-          taskRef: task.taskRef || "",
-          order: task.order,
-          projectName: task.projectName,
-          title: task.title,
-          description: task.description,
-          priority: task.priority,
-          status: task.status,
-          dueDate: task.dueDate,
-          assigneeId: task.assigneeId,
-          assigneeName: task.assigneeName,
-          ...mapTaskReporter(task),
-          estimatedTime: task.estimatedTime,
-          totalTimeSpent: task.totalTimeSpent,
-          remainingTime: task.remainingTime,
-          createdAt: task.createdAt,
-          // file attach - helal / bayijid
-          attachments: task.attachments || [],
-          // file attach - helal / bayijid
-        },
+      const createdTask = normalizeTask({
+        _id: result.insertedId,
+        ...task,
       });
+
+      emitTaskUpsert(createdTask);
+
+      res.status(201).json({ task: createdTask });
     });
 
     // DELETE /dashboard/projects/:projectId
@@ -2674,6 +2773,11 @@ async function run() {
 
       await tasksCollection.deleteOne({ _id: toId(taskId) });
       await timeLogsCollection.deleteMany({ taskId: toId(taskId) });
+      emitTaskDeleted({
+        id: String(task._id),
+        workspaceId: String(task.workspaceId),
+        projectId: task.projectId ? String(task.projectId) : "",
+      });
       return res.json({ ok: true });
     });
 
@@ -2810,12 +2914,13 @@ async function run() {
         const me = getUserIdentity(req);
         const session = client.startSession();
         let pendingNotification = [];
+        let pendingTaskUpsert = null;
 
         try {
           let responsePayload = null;
 
           await session.withTransaction(async () => {
-            pendingNotification = null;
+            pendingNotification = [];
             const task = await tasksCollection.findOne(
               { _id: toId(taskId) },
               { session },
@@ -3096,14 +3201,29 @@ async function run() {
                     // file attach - helal / bayijid
                     attachments: t.attachments || [],
                     // file attach - helal / bayijid
-                  })),
+                })),
               })),
             };
+
+            pendingTaskUpsert = normalizeTask(
+              boardTasks.find((item) => String(item._id) === String(taskId)) || {
+                _id: taskId,
+                workspaceId: workspace._id,
+                projectId: project._id,
+                boardId: responseBoard._id,
+                columnId: destinationId,
+                order: newOrder,
+                status: nextStatus,
+                title: task.title,
+              },
+            );
           });
 
           for (const n of pendingNotification) {
             await createNotification(n);
           }
+
+          emitTaskUpsert(pendingTaskUpsert);
 
           return res.json(responsePayload);
         } catch (error) {
@@ -3249,6 +3369,8 @@ async function run() {
       if (!t || !t._id)
         return res.status(404).json({ error: "Task not found" });
 
+      const updatedTask = normalizeTask(t);
+
       // Build the generic update summary without duplicating status notices.
       const changed = getGenericTaskUpdateChanges(patch, existingTask);
 
@@ -3276,40 +3398,9 @@ async function run() {
         });
       }
 
-      res.json({
-        task: {
-          id: String(t._id),
-          workspaceId: String(t.workspaceId),
-          projectId: t.projectId ? String(t.projectId) : "",
-          boardId: t.boardId ? String(t.boardId) : "",
-          columnId: t.columnId ? String(t.columnId) : "",
-          order: Number.isInteger(t.order) ? t.order : 0,
-          projectName: t.projectName || "",
-          title: t.title,
-          description: t.description || "",
-          priority: t.priority || "P2",
-          status: t.status || "todo",
-          dueDate: t.dueDate || "",
-          assigneeId: t.assigneeId || "",
-          assigneeName: t.assigneeName || "Unassigned",
-          ...mapTaskReporter(t),
-          createdAt: t.createdAt,
-          updatedAt: t.updatedAt || "",
-          estimatedTime: Number(t.estimatedTime || 0),
-          totalTimeSpent: Number(t.totalTimeSpent || 0),
-          remainingTime: Math.max(
-            Number(
-              t.remainingTime !== undefined
-                ? t.remainingTime
-                : Number(t.estimatedTime || 0) - Number(t.totalTimeSpent || 0),
-            ),
-            0,
-          ),
-          // file attach - helal / bayijid
-          attachments: t.attachments || [],
-          // file attach - helal / bayijid
-        },
-      });
+      emitTaskUpsert(updatedTask);
+
+      res.json({ task: updatedTask });
     });
 
     // POST /dashboard/notifications/read-all
@@ -4502,7 +4593,8 @@ async function run() {
           {
             $set: {
               members: (workspace.members || []).map((currentMember) =>
-                String(currentMember.id || currentMember.userId || "") === memberKey
+                String(currentMember.id || currentMember.userId || "") ===
+                memberKey
                   ? { ...currentMember, role: nextRole }
                   : currentMember,
               ),
@@ -4743,100 +4835,95 @@ async function run() {
       }
     });
 
+    // GET ROUTE: Fetch all comments for a specific task
+    app.get("/dashboard/comments/:taskId", async (req, res) => {
+      try {
+        const { taskId } = req.params;
 
-// GET ROUTE: Fetch all comments for a specific task
-app.get('/dashboard/comments/:taskId', async (req, res) => {
-  try {
-    const { taskId } = req.params;
-    
-    const comments = await commentsCollection
-      .find({ taskId: taskId })
-      .sort({ createdAt: -1 })
-      .toArray();
+        const comments = await commentsCollection
+          .find({ taskId: taskId })
+          .sort({ createdAt: -1 })
+          .toArray();
 
-    // ←←← new added
-    const formattedComments = comments.map(comment => ({
-      ...comment,
-      id: comment._id.toString(),  
-      _id: undefined               
-    }));
+        // ←←← new added
+        const formattedComments = comments.map((comment) => ({
+          ...comment,
+          id: comment._id.toString(),
+          _id: undefined,
+        }));
 
-    return res.json(formattedComments);
-  } catch (err) {
-    console.error("GET Comments Error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-    
-    
-    // ===============================================
-// NEW: EDIT COMMENT (PUT)
-// ===============================================
-app.put("/dashboard/:taskId/comments/:commentId", async (req, res) => {
-  try {
-    const { taskId, commentId } = req.params;
-    const { text } = req.body;
-
-    if (!text || text.trim() === "") {
-      return res.status(400).json({ error: "Comment text is required" });
-    }
-
-    const result = await commentsCollection.updateOne(
-      { 
-        _id: new ObjectId(commentId),
-        taskId: taskId  
-      },
-      { 
-        $set: { 
-          text: text.trim(),
-          updatedAt: new Date().toISOString() 
-        } 
+        return res.json(formattedComments);
+      } catch (err) {
+        console.error("GET Comments Error:", err);
+        res.status(500).json({ error: "Server error" });
       }
-    );
-
-    if (result.matchedCount === 0) {
-      return res.status(404).json({ error: "Comment not found" });
-    }
-
-    res.json({ 
-      ok: true, 
-      message: "Comment updated successfully" 
-    });
-  } catch (err) {
-    console.error("PUT Comment Error:", err);
-    res.status(500).json({ error: "Failed to update comment" });
-  }
-});
-
-
-// ===============================================
-// NEW: DELETE COMMENT (DELETE)
-// ===============================================
-app.delete("/dashboard/:taskId/comments/:commentId", async (req, res) => {
-  try {
-    const { taskId, commentId } = req.params;
-
-    const result = await commentsCollection.deleteOne({
-      _id: new ObjectId(commentId),
-      taskId: taskId
     });
 
-    if (result.deletedCount === 0) {
-      return res.status(404).json({ error: "Comment not found" });
-    }
+    // ===============================================
+    // NEW: EDIT COMMENT (PUT)
+    // ===============================================
+    app.put("/dashboard/:taskId/comments/:commentId", async (req, res) => {
+      try {
+        const { taskId, commentId } = req.params;
+        const { text } = req.body;
 
-    res.json({ 
-      ok: true, 
-      message: "Comment deleted successfully" 
+        if (!text || text.trim() === "") {
+          return res.status(400).json({ error: "Comment text is required" });
+        }
+
+        const result = await commentsCollection.updateOne(
+          {
+            _id: new ObjectId(commentId),
+            taskId: taskId,
+          },
+          {
+            $set: {
+              text: text.trim(),
+              updatedAt: new Date().toISOString(),
+            },
+          },
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ error: "Comment not found" });
+        }
+
+        res.json({
+          ok: true,
+          message: "Comment updated successfully",
+        });
+      } catch (err) {
+        console.error("PUT Comment Error:", err);
+        res.status(500).json({ error: "Failed to update comment" });
+      }
     });
-  } catch (err) {
-    console.error("DELETE Comment Error:", err);
-    res.status(500).json({ error: "Failed to delete comment" });
-  }
-});
+
+    // ===============================================
+    // NEW: DELETE COMMENT (DELETE)
+    // ===============================================
+    app.delete("/dashboard/:taskId/comments/:commentId", async (req, res) => {
+      try {
+        const { taskId, commentId } = req.params;
+
+        const result = await commentsCollection.deleteOne({
+          _id: new ObjectId(commentId),
+          taskId: taskId,
+        });
+
+        if (result.deletedCount === 0) {
+          return res.status(404).json({ error: "Comment not found" });
+        }
+
+        res.json({
+          ok: true,
+          message: "Comment deleted successfully",
+        });
+      } catch (err) {
+        console.error("DELETE Comment Error:", err);
+        res.status(500).json({ error: "Failed to delete comment" });
+      }
+    });
     // ------------------------------Lipi end--------------------------------------------
-    
 
     // ------------------------------Lipi end--------------------------------------------
 
@@ -4868,8 +4955,12 @@ if (process.env.NODE_ENV !== "test") {
 
 module.exports = {
   attachSocketServer,
+  emitTaskDeleted,
+  emitTaskUpsert,
   getGenericTaskUpdateChanges,
+  getProjectRoom,
   getUserRoom,
+  getWorkspaceRoom,
 };
 
 // if (process.env.NODE_ENV !== "production") {
