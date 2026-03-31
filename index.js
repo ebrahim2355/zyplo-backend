@@ -80,6 +80,30 @@ const inviteSchema = z.object({
 
 // Put all tabs for one user in the same room.
 const getUserRoom = (userId) => `user:${String(userId)}`;
+// Group workspace-wide task listeners together.
+const getWorkspaceRoom = (workspaceId) => `workspace:${String(workspaceId)}`;
+// Group board task listeners by project.
+const getProjectRoom = (projectId) => `project:${String(projectId)}`;
+// Broadcast a saved task to the active workspace and project listeners.
+const emitTaskUpsert = (task) => {
+  if (!io || !task?.id) return;
+  if (task.workspaceId) {
+    io.to(getWorkspaceRoom(task.workspaceId)).emit("task:upsert", task);
+  }
+  if (task.projectId) {
+    io.to(getProjectRoom(task.projectId)).emit("task:upsert", task);
+  }
+};
+// Broadcast a deleted task id to the active workspace and project listeners.
+const emitTaskDeleted = (task) => {
+  if (!io || !task?.id) return;
+  if (task.workspaceId) {
+    io.to(getWorkspaceRoom(task.workspaceId)).emit("task:deleted", task);
+  }
+  if (task.projectId) {
+    io.to(getProjectRoom(task.projectId)).emit("task:deleted", task);
+  }
+};
 
 // Keep generic task update notifications for non-status fields only.
 const getGenericTaskUpdateChanges = (patch, existingTask) => {
@@ -124,6 +148,25 @@ const attachSocketServer = (server) => {
   // Join every connected tab to the user's room.
   io.on("connection", (socket) => {
     socket.join(getUserRoom(socket.user.id));
+
+    // Subscribe the active page to workspace and project task rooms.
+    socket.on(
+      "task:subscribe",
+      ({ workspaceId = "", projectId = "" } = {}, done = () => {}) => {
+      if (workspaceId) socket.join(getWorkspaceRoom(workspaceId));
+      if (projectId) socket.join(getProjectRoom(projectId));
+      done();
+    });
+
+    // Leave task rooms when the active page context changes.
+    socket.on(
+      "task:unsubscribe",
+      ({ workspaceId = "", projectId = "" } = {}, done = () => {}) => {
+        if (workspaceId) socket.leave(getWorkspaceRoom(workspaceId));
+        if (projectId) socket.leave(getProjectRoom(projectId));
+        done();
+      },
+    );
   });
 
   return io;
@@ -708,6 +751,42 @@ async function run() {
       reporterId: String(task?.reporterId || ""),
       reporterName: String(task?.reporterName || ""),
       reporterEmail: String(task?.reporterEmail || ""),
+    });
+
+    // Reuse one task shape for REST responses and live task events.
+    const normalizeTask = (task) => ({
+      id: String(task?._id || task?.id || ""),
+      workspaceId: String(task?.workspaceId || ""),
+      projectId: task?.projectId ? String(task.projectId) : "",
+      boardId: task?.boardId ? String(task.boardId) : "",
+      columnId: task?.columnId ? String(task.columnId) : "",
+      order: Number.isInteger(task?.order) ? task.order : 0,
+      taskNumber: task?.taskNumber || "",
+      taskRef: task?.taskRef || "",
+      projectName: task?.projectName || "",
+      title: task?.title,
+      description: task?.description || "",
+      priority: task?.priority || "P2",
+      status: task?.status || "todo",
+      dueDate: task?.dueDate || "",
+      assigneeId: task?.assigneeId || "",
+      assigneeName: task?.assigneeName || "Unassigned",
+      ...mapTaskReporter(task),
+      createdAt: task?.createdAt,
+      updatedAt: task?.updatedAt || "",
+      estimatedTime: Number(task?.estimatedTime || 0),
+      totalTimeSpent: Number(task?.totalTimeSpent || 0),
+      remainingTime: Math.max(
+        Number(
+          task?.remainingTime !== undefined
+            ? task.remainingTime
+            : Number(task?.estimatedTime || 0) -
+                Number(task?.totalTimeSpent || 0),
+        ),
+        0,
+      ),
+      // Keep file attachments in the live payload too.
+      attachments: task?.attachments || [],
     });
 
     // ---- Status notification helpers ----
@@ -2408,7 +2487,18 @@ async function run() {
             };
           });
 
-          await tasksCollection.insertMany(newTasks);
+          const aiInsertResult = await tasksCollection.insertMany(newTasks);
+
+          // Sync AI-created tasks to active task views too.
+          Object.values(aiInsertResult.insertedIds || {}).forEach((insertedId, index) => {
+            emitTaskUpsert(
+              normalizeTask({
+                _id: insertedId,
+                ...newTasks[index],
+              }),
+            );
+          });
+
           return res.status(201).json({
             message: "AI Kickstart complete",
             tasksAdded: newTasks.length,
@@ -2584,36 +2674,14 @@ async function run() {
         });
       }
 
-      res.status(201).json({
-        task: {
-          id: String(result.insertedId),
-          workspaceId,
-          projectId: String(task.projectId),
-          boardId: String(task.boardId),
-          columnId: String(task.columnId),
-          // Keep taskRef/taskNumber in the response so the frontend can render
-          // it immediately (and not "lose" it during store merges).
-          taskNumber: task.taskNumber || "",
-          taskRef: task.taskRef || "",
-          order: task.order,
-          projectName: task.projectName,
-          title: task.title,
-          description: task.description,
-          priority: task.priority,
-          status: task.status,
-          dueDate: task.dueDate,
-          assigneeId: task.assigneeId,
-          assigneeName: task.assigneeName,
-          ...mapTaskReporter(task),
-          estimatedTime: task.estimatedTime,
-          totalTimeSpent: task.totalTimeSpent,
-          remainingTime: task.remainingTime,
-          createdAt: task.createdAt,
-          // file attach - helal / bayijid
-          attachments: task.attachments || [],
-          // file attach - helal / bayijid
-        },
+      const createdTask = normalizeTask({
+        _id: result.insertedId,
+        ...task,
       });
+
+      emitTaskUpsert(createdTask);
+
+      res.status(201).json({ task: createdTask });
     });
 
     // DELETE /dashboard/projects/:projectId
@@ -2705,6 +2773,11 @@ async function run() {
 
       await tasksCollection.deleteOne({ _id: toId(taskId) });
       await timeLogsCollection.deleteMany({ taskId: toId(taskId) });
+      emitTaskDeleted({
+        id: String(task._id),
+        workspaceId: String(task.workspaceId),
+        projectId: task.projectId ? String(task.projectId) : "",
+      });
       return res.json({ ok: true });
     });
 
@@ -2841,12 +2914,13 @@ async function run() {
         const me = getUserIdentity(req);
         const session = client.startSession();
         let pendingNotification = [];
+        let pendingTaskUpsert = null;
 
         try {
           let responsePayload = null;
 
           await session.withTransaction(async () => {
-            pendingNotification = null;
+            pendingNotification = [];
             const task = await tasksCollection.findOne(
               { _id: toId(taskId) },
               { session },
@@ -3127,14 +3201,29 @@ async function run() {
                     // file attach - helal / bayijid
                     attachments: t.attachments || [],
                     // file attach - helal / bayijid
-                  })),
+                })),
               })),
             };
+
+            pendingTaskUpsert = normalizeTask(
+              boardTasks.find((item) => String(item._id) === String(taskId)) || {
+                _id: taskId,
+                workspaceId: workspace._id,
+                projectId: project._id,
+                boardId: responseBoard._id,
+                columnId: destinationId,
+                order: newOrder,
+                status: nextStatus,
+                title: task.title,
+              },
+            );
           });
 
           for (const n of pendingNotification) {
             await createNotification(n);
           }
+
+          emitTaskUpsert(pendingTaskUpsert);
 
           return res.json(responsePayload);
         } catch (error) {
@@ -3280,6 +3369,8 @@ async function run() {
       if (!t || !t._id)
         return res.status(404).json({ error: "Task not found" });
 
+      const updatedTask = normalizeTask(t);
+
       // Build the generic update summary without duplicating status notices.
       const changed = getGenericTaskUpdateChanges(patch, existingTask);
 
@@ -3307,40 +3398,9 @@ async function run() {
         });
       }
 
-      res.json({
-        task: {
-          id: String(t._id),
-          workspaceId: String(t.workspaceId),
-          projectId: t.projectId ? String(t.projectId) : "",
-          boardId: t.boardId ? String(t.boardId) : "",
-          columnId: t.columnId ? String(t.columnId) : "",
-          order: Number.isInteger(t.order) ? t.order : 0,
-          projectName: t.projectName || "",
-          title: t.title,
-          description: t.description || "",
-          priority: t.priority || "P2",
-          status: t.status || "todo",
-          dueDate: t.dueDate || "",
-          assigneeId: t.assigneeId || "",
-          assigneeName: t.assigneeName || "Unassigned",
-          ...mapTaskReporter(t),
-          createdAt: t.createdAt,
-          updatedAt: t.updatedAt || "",
-          estimatedTime: Number(t.estimatedTime || 0),
-          totalTimeSpent: Number(t.totalTimeSpent || 0),
-          remainingTime: Math.max(
-            Number(
-              t.remainingTime !== undefined
-                ? t.remainingTime
-                : Number(t.estimatedTime || 0) - Number(t.totalTimeSpent || 0),
-            ),
-            0,
-          ),
-          // file attach - helal / bayijid
-          attachments: t.attachments || [],
-          // file attach - helal / bayijid
-        },
-      });
+      emitTaskUpsert(updatedTask);
+
+      res.json({ task: updatedTask });
     });
 
     // POST /dashboard/notifications/read-all
@@ -4895,8 +4955,12 @@ if (process.env.NODE_ENV !== "test") {
 
 module.exports = {
   attachSocketServer,
+  emitTaskDeleted,
+  emitTaskUpsert,
   getGenericTaskUpdateChanges,
+  getProjectRoom,
   getUserRoom,
+  getWorkspaceRoom,
 };
 
 // if (process.env.NODE_ENV !== "production") {
